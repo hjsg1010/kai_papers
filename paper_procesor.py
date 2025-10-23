@@ -28,7 +28,6 @@ app = FastAPI(title="AI Paper Newsletter Processor - Internal")
 # Configuration
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 S3_PAPERS_PREFIX = os.getenv("S3_PAPERS_PREFIX", "papers/")
 
@@ -54,7 +53,6 @@ s3_client = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=AWS_REGION
 )
 
 
@@ -750,4 +748,4 @@ async def list_s3_papers(bucket: Optional[str] = None, prefix: Optional[str] = N
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=7070)
