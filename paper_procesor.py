@@ -1,17 +1,21 @@
+#!/usr/bin/env python3
 """
-AI Paper Newsletter Processor
-FastAPI service for processing papers from S3
-Uses Docpamin API for parsing and OpenAI-compatible LLM for analysis
+AI Paper Newsletter Processor (S3-only, Markdown + Git-ready)
+- S3에서 PDF 수집
+- Docpamin(API)로 파싱 → LLM으로 섹션/전체 요약
+- Markdown 문서 생성 (wNN.md)
+- (옵션) Confluence 업로드
+- n8n에서 md를 받아 Git에 업로드 가능
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Tuple
-import boto3
+from typing import List, Optional, Dict, Tuple, Iterable
 from datetime import datetime
-import os
-import tempfile
 from pathlib import Path
+import boto3
+from botocore.config import Config
+import tempfile
 import logging
 import json
 import time
@@ -19,57 +23,71 @@ import requests
 import zipfile
 import io
 import re
+import fnmatch
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import textwrap
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI Paper Newsletter Processor - Internal")
+app = FastAPI(
+    title="AI Paper Newsletter Processor - Internal",
+    description="Processes AI papers from S3, parses via Docpamin, summarizes with LLM, returns Markdown.",
+    version="1.1.0",
+)
 
-# Configuration
+# ===== Configuration (env) =====
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 S3_PAPERS_PREFIX = os.getenv("S3_PAPERS_PREFIX", "papers/")
 
-# Docpamin API Configuration
 DOCPAMIN_API_KEY = os.getenv("DOCPAMIN_API_KEY")
 DOCPAMIN_BASE_URL = os.getenv("DOCPAMIN_BASE_URL", "https://docpamin.superaip.samsungds.net/api/v1")
 DOCPAMIN_CRT_FILE = os.getenv("DOCPAMIN_CRT_FILE", "/etc/ssl/certs/ca-certificates.crt")
 
-# OpenAI Compatible LLM Configuration
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4")
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 
-# Confluence Configuration
 CONFLUENCE_URL = os.getenv("CONFLUENCE_URL")
 CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL")
 CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN")
 CONFLUENCE_SPACE_KEY = os.getenv("CONFLUENCE_SPACE_KEY")
 
-# Initialize clients
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
+
+# ===== boto3 client (retry/timeout tuned) =====
+boto_config = Config(
+    retries={"max_attempts": 5, "mode": "standard"},
+    connect_timeout=10,
+    read_timeout=60,
+)
 s3_client = boto3.client(
-    's3',
+    "s3",
     aws_access_key_id=AWS_ACCESS_KEY,
     aws_secret_access_key=AWS_SECRET_KEY,
+    config=boto_config,
 )
 
-
+# ===== Models =====
 class S3PapersRequest(BaseModel):
     bucket: Optional[str] = None
     prefix: Optional[str] = None
-    # Optional filters
     file_pattern: Optional[str] = "*.pdf"
     process_subdirectories: bool = True
-
+    # 신규 옵션
+    week_label: Optional[str] = None
+    upload_confluence: Optional[bool] = False
 
 class BatchProcessRequest(BaseModel):
     bucket: Optional[str] = None
     prefix: Optional[str] = None
     confluence_page_title: Optional[str] = None
     tags: List[str] = ["AI", "Research"]
-
 
 class PaperAnalysis(BaseModel):
     title: str
@@ -83,83 +101,70 @@ class PaperAnalysis(BaseModel):
     tags: List[str]
     source_file: str  # S3 key
 
+# ===== Utilities =====
+def _iter_s3_objects(bucket: str, prefix: str) -> Iterable[Dict]:
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            yield obj
 
-def get_s3_papers(bucket: str, prefix: str, file_pattern: str = "*.pdf", 
-                  process_subdirectories: bool = True) -> List[Dict]:
-    """Get PDF files from S3 bucket"""
-    logger.info(f"Fetching papers from S3: s3://{bucket}/{prefix}")
-    
+def get_s3_papers(
+    bucket: str,
+    prefix: str,
+    file_pattern: str = "*.pdf",
+    process_subdirectories: bool = True,
+    min_size_bytes: int = 1024,
+    max_size_bytes: int = 1024 * 1024 * 100,
+) -> List[Dict]:
+    logger.info(f"Fetching papers from S3: s3://{bucket}/{prefix} (pattern={file_pattern})")
     papers = []
-    try:
-        paginator = s3_client.get_paginator('list_objects_v2')
-        
-        # List all objects in the prefix
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            if 'Contents' not in page:
-                continue
-                
-            for obj in page['Contents']:
-                key = obj['Key']
-                
-                # Skip if not a PDF
-                if not key.lower().endswith('.pdf'):
-                    continue
-                
-                # Skip subdirectories if not processing them
-                if not process_subdirectories:
-                    # Check if file is directly in the prefix directory
-                    relative_path = key[len(prefix):].lstrip('/')
-                    if '/' in relative_path:
-                        continue
-                
-                # Extract metadata from S3 object
-                file_name = Path(key).stem
-                
-                papers.append({
-                    "title": file_name.replace('_', ' ').replace('-', ' '),
-                    "s3_key": key,
-                    "s3_bucket": bucket,
-                    "last_modified": obj['LastModified'].isoformat(),
-                    "size_bytes": obj['Size'],
-                    "source": "s3"
-                })
-        
-        logger.info(f"Found {len(papers)} papers in S3")
-    except Exception as e:
-        logger.error(f"Error fetching from S3: {str(e)}")
-        raise
-    
+    for obj in _iter_s3_objects(bucket, prefix):
+        key = obj["Key"]
+        rel = key[len(prefix):].lstrip("/") if key.startswith(prefix) else key
+
+        if not fnmatch.fnmatch(rel, file_pattern):
+            continue
+        if not process_subdirectories and "/" in rel:
+            continue
+        size = obj.get("Size", 0)
+        if size < min_size_bytes or size > max_size_bytes:
+            continue
+
+        papers.append({
+            "title": Path(key).stem.replace("_", " ").replace("-", " "),
+            "s3_key": key,
+            "s3_bucket": bucket,
+            "last_modified": obj["LastModified"].isoformat(),
+            "size_bytes": size,
+            "source": "s3",
+        })
+
+    logger.info(f"Found {len(papers)} papers in S3 (after filtering)")
     return papers
 
-
 def download_pdf_from_s3(s3_key: str, s3_bucket: str) -> str:
-    """Download PDF from S3 to temp file"""
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-    
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     try:
-        logger.info(f"Downloading PDF from S3: {s3_bucket}/{s3_key}")
-        s3_client.download_fileobj(s3_bucket, s3_key, temp_file)
-        temp_file.close()
-        return temp_file.name
+        logger.info(f"Downloading PDF: s3://{s3_bucket}/{s3_key}")
+        s3_client.download_fileobj(s3_bucket, s3_key, tmp)
+        tmp.close()
+        return tmp.name
     except Exception as e:
-        temp_file.close()
-        if os.path.exists(temp_file.name):
-            os.unlink(temp_file.name)
-        raise Exception(f"Failed to download PDF from S3: {str(e)}")
+        tmp.close()
+        if os.path.exists(tmp.name):
+            try: os.unlink(tmp.name)
+            except Exception: pass
+        raise Exception(f"Failed to download PDF: {e}")
 
-
+# ===== Docpamin =====
 def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
-    """
-    Parse PDF using Docpamin API
-    Returns: (markdown_content, json_content)
-    """
-    logger.info(f"Parsing PDF with Docpamin API: {pdf_path}")
-    
-    headers = {"Authorization": f"bearer {DOCPAMIN_API_KEY}"}
-    
+    logger.info(f"Parsing via Docpamin: {pdf_path}")
+    headers = {"Authorization": f"Bearer {DOCPAMIN_API_KEY}"}
+    session = requests.Session()
+    session.headers.update(headers)
+    REQ_TIMEOUT = 30
+
     try:
-        # Step 1: Create Task
-        logger.info("Step 1: Creating Docpamin task...")
         with open(pdf_path, "rb") as f:
             files = {"file": f}
             data = {
@@ -172,580 +177,462 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
                     },
                 }),
             }
-            
-            resp = requests.post(
-                f"{DOCPAMIN_BASE_URL}/tasks",
-                headers=headers,
-                files=files,
-                data=data,
-                verify=DOCPAMIN_CRT_FILE
-            )
-            resp.raise_for_status()
-            
-            task_id = resp.json().get("task_id")
-            if not task_id:
-                raise Exception("Failed to create task: no task_id returned")
-            
-            logger.info(f"Task created: {task_id}")
-        
-        # Step 2: Poll Task Status
-        logger.info("Step 2: Waiting for task completion...")
-        max_wait = 300  # 5 minutes
-        wait_time = 0
-        
-        while wait_time < max_wait:
-            resp = requests.get(
-                f"{DOCPAMIN_BASE_URL}/tasks/{task_id}",
-                headers=headers,
-                verify=DOCPAMIN_CRT_FILE
-            )
-            resp.raise_for_status()
-            
-            status = resp.json().get("status")
-            logger.info(f"Task status: {status}")
-            
+            r = session.post(f"{DOCPAMIN_BASE_URL}/tasks", files=files, data=data,
+                             verify=DOCPAMIN_CRT_FILE, timeout=REQ_TIMEOUT)
+        r.raise_for_status()
+        task_id = r.json().get("task_id")
+        if not task_id:
+            raise Exception("Docpamin: no task_id returned")
+
+        logger.info(f"Docpamin task: {task_id}")
+        # Poll
+        max_wait, waited, backoff = 600, 0, 2
+        while waited < max_wait:
+            s = session.get(f"{DOCPAMIN_BASE_URL}/tasks/{task_id}",
+                            verify=DOCPAMIN_CRT_FILE, timeout=REQ_TIMEOUT)
+            s.raise_for_status()
+            status = s.json().get("status")
+            logger.info(f"Docpamin status={status}")
             if status == "DONE":
-                logger.info("Task completed successfully")
                 break
-            elif status in ["FAILED", "ERROR"]:
-                raise Exception(f"Task failed with status: {status}")
-            
-            time.sleep(3)
-            wait_time += 3
-        
-        if wait_time >= max_wait:
-            raise Exception("Task timeout: exceeded 5 minutes")
-        
-        # Step 3: Download Results
-        logger.info("Step 3: Downloading results...")
-        options = {
-            "task_ids": [task_id],
-            "output_types": ["markdown", "json"]
-        }
-        
-        resp = requests.post(
-            f"{DOCPAMIN_BASE_URL}/tasks/export",
-            headers=headers,
-            json=options,
-            verify=DOCPAMIN_CRT_FILE
-        )
-        resp.raise_for_status()
-        
-        # Extract content from ZIP
-        logger.info("Extracting content from ZIP...")
-        markdown_content = ""
-        json_content = {}
-        
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            for filename in zf.namelist():
-                if filename.endswith('.md'):
-                    with zf.open(filename) as f:
-                        markdown_content = f.read().decode('utf-8')
-                        logger.info(f"Extracted markdown: {len(markdown_content)} characters")
-                elif filename.endswith('.json'):
-                    with zf.open(filename) as f:
-                        json_content = json.loads(f.read().decode('utf-8'))
-                        logger.info(f"Extracted JSON metadata")
-        
-        if not markdown_content:
-            raise Exception("No markdown content found in export")
-        
-        logger.info(f"Successfully parsed PDF: {len(markdown_content)} characters")
-        return markdown_content, json_content
-        
+            if status in {"FAILED", "ERROR"}:
+                raise Exception(f"Docpamin task failed: {status}")
+            time.sleep(backoff)
+            waited += backoff
+            backoff = min(backoff * 1.5, 10)
+        if waited >= max_wait:
+            raise Exception("Docpamin timeout")
+
+        # Export
+        opts = {"task_ids": [task_id], "output_types": ["markdown", "json"]}
+        e = session.post(f"{DOCPAMIN_BASE_URL}/tasks/export", json=opts,
+                         verify=DOCPAMIN_CRT_FILE, timeout=REQ_TIMEOUT)
+        e.raise_for_status()
+
+        md, meta = "", {}
+        with zipfile.ZipFile(io.BytesIO(e.content)) as zf:
+            for fn in zf.namelist():
+                with zf.open(fn) as fh:
+                    if fn.endswith(".md"):
+                        s = fh.read().decode("utf-8", errors="ignore")
+                        if len(s) > len(md):
+                            md = s
+                    elif fn.endswith(".json"):
+                        try:
+                            meta = json.loads(fh.read().decode("utf-8", errors="ignore"))
+                        except Exception:
+                            pass
+        if not md:
+            raise Exception("Docpamin: no markdown in export")
+        logger.info(f"Docpamin parsed OK (md_len={len(md)})")
+        return md, meta
     except Exception as e:
-        logger.error(f"Error parsing PDF with Docpamin: {str(e)}")
+        logger.error(f"Docpamin error: {e}")
         raise
 
-
-def extract_sections_from_markdown(markdown_content: str) -> Dict[str, str]:
-    """
-    Extract sections from markdown content
-    Identifies common paper sections: Abstract, Introduction, Methods, Results, Discussion, Conclusion
-    """
-    logger.info("Extracting sections from markdown...")
-    
-    sections = {
-        "abstract": "",
-        "introduction": "",
-        "methods": "",
-        "results": "",
-        "discussion": "",
-        "conclusion": "",
-        "other": ""
-    }
-    
-    # Common section headers (case-insensitive)
-    section_patterns = {
-        "abstract": r"##?\s*(?:abstract|요약)",
-        "introduction": r"##?\s*(?:introduction|서론|배경)",
-        "methods": r"##?\s*(?:methods?|methodology|approach|방법)",
-        "results": r"##?\s*(?:results?|experiments?|결과|실험)",
-        "discussion": r"##?\s*(?:discussion|analysis|분석|논의)",
-        "conclusion": r"##?\s*(?:conclusion|summary|결론|요약)"
-    }
-    
-    # Split by headers
-    lines = markdown_content.split('\n')
-    current_section = "other"
-    current_content = []
-    
-    for line in lines:
-        # Check if this line is a section header
-        matched_section = None
-        for section_name, pattern in section_patterns.items():
-            if re.match(pattern, line.strip(), re.IGNORECASE):
-                # Save previous section
-                if current_content:
-                    sections[current_section] += '\n'.join(current_content) + '\n'
-                
-                # Start new section
-                matched_section = section_name
-                current_content = [line]
-                break
-        
-        if matched_section:
-            current_section = matched_section
-        else:
-            current_content.append(line)
-    
-    # Save last section
-    if current_content:
-        sections[current_section] += '\n'.join(current_content)
-    
-    # Log section sizes
-    for section, content in sections.items():
-        if content.strip():
-            logger.info(f"Section '{section}': {len(content)} characters")
-    
-    return sections
-
+# ===== LLM utils =====
+def _estimate_tokens(s: str) -> int:
+    return max(1, math.ceil(len(s) / 4))
 
 def call_llm(messages: List[Dict], max_tokens: int = 2000) -> str:
-    """
-    Call OpenAI-compatible LLM API
-    """
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.3
-    }
-    
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": LLM_MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2}
     try:
-        response = requests.post(
-            f"{LLM_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=120
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        return result['choices'][0]['message']['content']
-        
+        r = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=120)
+        r.raise_for_status()
+        j = r.json()
+        return j["choices"][0]["message"]["content"]
     except Exception as e:
-        logger.error(f"LLM API call failed: {str(e)}")
+        logger.error(f"LLM call failed: {e}")
         raise
 
+def extract_sections_from_markdown(markdown_content: str) -> Dict[str, str]:
+    logger.info("Extracting sections from markdown...")
+    sections = {k: "" for k in ["abstract","introduction","methods","results","discussion","conclusion","other"]}
+    header_map = {
+        "abstract": r"^#{1,3}\s*(abstract|요약)\b",
+        "introduction": r"^#{1,3}\s*(introduction|서론|배경)\b",
+        "methods": r"^#{1,3}\s*(methods?|methodology|approach|방법)\b",
+        "results": r"^#{1,3}\s*(results?|experiments?|결과|실험)\b",
+        "discussion": r"^#{1,3}\s*(discussion|analysis|분석|논의)\b",
+        "conclusion": r"^#{1,3}\s*(conclusion|summary|결론|요약)\b",
+    }
+    current = "other"
+    buf: List[str] = []
+    for line in markdown_content.splitlines():
+        matched = None
+        for sec, pat in header_map.items():
+            if re.search(pat, line.strip(), re.IGNORECASE):
+                matched = sec; break
+        if matched:
+            if buf:
+                sections[current] += "\n".join(buf) + "\n"
+                buf = []
+            current = matched
+        buf.append(line)
+    if buf:
+        sections[current] += "\n".join(buf)
+    for k, v in sections.items():
+        if v.strip():
+            logger.info(f"Section '{k}': {len(v)} chars, ~{_estimate_tokens(v)} toks")
+    return sections
 
 def summarize_section(section_name: str, section_content: str, paper_title: str) -> str:
-    """
-    Summarize a single section of the paper
-    """
     if not section_content.strip():
         return ""
-    
-    logger.info(f"Summarizing section: {section_name} ({len(section_content)} chars)")
-    
-    # Adjust prompt based on section
-    section_prompts = {
-        "abstract": "이 논문의 Abstract를 핵심 내용 위주로 간결하게 요약해주세요.",
-        "introduction": "Introduction 섹션의 주요 내용(배경, 문제 정의, 연구 목적)을 요약해주세요.",
-        "methods": "Methods 섹션의 핵심 방법론과 접근법을 요약해주세요.",
-        "results": "Results 섹션의 주요 실험 결과와 성능 지표를 요약해주세요.",
-        "discussion": "Discussion 섹션의 핵심 인사이트와 분석을 요약해주세요.",
-        "conclusion": "Conclusion 섹션의 주요 결론과 기여점을 요약해주세요.",
-        "other": "다음 내용의 핵심을 요약해주세요."
+    prompts = {
+        "abstract": "Abstract 핵심을 간결하게 요약.",
+        "introduction": "Introduction의 배경/문제/목표를 요약.",
+        "methods": "Methods의 핵심 알고리즘/모델/데이터/학습설정 요약.",
+        "results": "Results의 주요 실험설정/지표/비교결과 요약.",
+        "discussion": "Discussion의 인사이트/의미/한계 요약.",
+        "conclusion": "Conclusion의 결론/기여/향후과제 요약.",
+        "other": "다음 내용을 핵심 위주로 요약.",
     }
-    
-    prompt = section_prompts.get(section_name, section_prompts["other"])
-    
-    # Chunk if too long (assume ~4 chars per token, leave room for prompt)
-    max_section_chars = (LLM_MAX_TOKENS - 500) * 4
-    
-    if len(section_content) > max_section_chars:
-        logger.info(f"Section too long, chunking: {len(section_content)} chars")
-        # Split into chunks
-        chunks = []
-        for i in range(0, len(section_content), max_section_chars):
-            chunks.append(section_content[i:i+max_section_chars])
-        
-        # Summarize each chunk
-        chunk_summaries = []
-        for i, chunk in enumerate(chunks):
-            logger.info(f"Processing chunk {i+1}/{len(chunks)}")
-            messages = [
-                {"role": "system", "content": "당신은 학술 논문 분석 전문가입니다. 핵심 정보를 누락 없이 간결하게 요약합니다."},
-                {"role": "user", "content": f"{prompt}\n\n내용:\n{chunk}"}
-            ]
-            chunk_summary = call_llm(messages, max_tokens=1000)
-            chunk_summaries.append(chunk_summary)
-        
-        # Merge chunk summaries
-        if len(chunk_summaries) > 1:
-            merged_content = "\n\n".join(chunk_summaries)
-            messages = [
-                {"role": "system", "content": "당신은 학술 논문 분석 전문가입니다."},
-                {"role": "user", "content": f"다음은 '{section_name}' 섹션의 부분 요약들입니다. 이를 하나의 통합된 요약으로 만들어주세요:\n\n{merged_content}"}
-            ]
-            return call_llm(messages, max_tokens=1500)
-        else:
-            return chunk_summaries[0]
-    else:
-        messages = [
-            {"role": "system", "content": "당신은 학술 논문 분석 전문가입니다. 핵심 정보를 누락 없이 간결하게 요약합니다."},
-            {"role": "user", "content": f"{prompt}\n\n내용:\n{section_content}"}
-        ]
-        return call_llm(messages, max_tokens=1500)
+    prompt = prompts.get(section_name, prompts["other"])
+    budget_tokens = min(LLM_MAX_TOKENS - 800, 3000)
+    approx = _estimate_tokens(section_content)
+    chunks = [section_content]
+    if approx > budget_tokens:
+        n = math.ceil(approx / budget_tokens)
+        step = math.ceil(len(section_content) / n)
+        chunks = [section_content[i:i+step] for i in range(0, len(section_content), step)]
 
+    summaries = []
+    for ch in chunks:
+        msgs = [
+            {"role": "system", "content": "You are an expert AI paper analyst. Keep technical terms in English."},
+            {"role": "user", "content": f"[{paper_title}] {prompt}\n\nContent:\n{ch}"},
+        ]
+        summaries.append(call_llm(msgs, max_tokens=min(1500, LLM_MAX_TOKENS - 500)))
+
+    if len(summaries) == 1:
+        return summaries[0]
+    merge_msgs = [
+        {"role": "system", "content": "You are an expert AI paper analyst."},
+        {"role": "user", "content": "Merge the partial summaries into one concise section summary:\n\n" + "\n\n".join(summaries)},
+    ]
+    return call_llm(merge_msgs, max_tokens=1200)
+
+def _json_extract(s: str) -> Optional[Dict]:
+    m = re.search(r"\{[\s\S]*\}", s)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
 
 def analyze_paper_with_llm(paper_info: Dict, markdown_content: str, json_metadata: Dict) -> PaperAnalysis:
-    """
-    Analyze paper content using OpenAI-compatible LLM with hierarchical summarization
-    """
-    logger.info(f"Analyzing paper with LLM: {paper_info.get('title', 'Unknown')}")
-    
-    try:
-        # Step 1: Extract sections
-        sections = extract_sections_from_markdown(markdown_content)
-        
-        # Step 2: Summarize each section
-        section_summaries = {}
-        for section_name, section_content in sections.items():
-            if section_content.strip():
-                summary = summarize_section(
-                    section_name, 
-                    section_content, 
-                    paper_info.get('title', 'Unknown')
-                )
-                if summary:
-                    section_summaries[section_name] = summary
-        
-        logger.info(f"Created {len(section_summaries)} section summaries")
-        
-        # Step 3: Create comprehensive analysis by combining section summaries
-        combined_summaries = "\n\n".join([
-            f"**{name.upper()}**:\n{summary}" 
-            for name, summary in section_summaries.items()
-        ])
-        
-        # Step 4: Generate final comprehensive analysis
-        logger.info("Generating final comprehensive analysis...")
-        
-        final_prompt = f"""다음은 논문 "{paper_info.get('title', 'Unknown')}"의 섹션별 요약입니다.
+    logger.info(f"Analyzing paper with LLM: {paper_info.get('title','Unknown')}")
+    sections = extract_sections_from_markdown(markdown_content)
+    section_summaries: Dict[str, str] = {}
+    for sec, content in sections.items():
+        if content.strip():
+            section_summaries[sec] = summarize_section(sec, content, paper_info.get("title","Unknown"))
 
-{combined_summaries}
+    combined = "\n\n".join([f"## {k.title()}\n{v}" for k, v in section_summaries.items() if v.strip()])
+    format_hint = {
+        "title": paper_info.get("title","Unknown"),
+        "tldr": "",
+        "key_contributions": [],
+        "methodology": "",
+        "results": "",
+        "novelty": "",
+        "limitations": [],
+        "relevance_score": 7,
+        "tags": [],
+    }
+    final_prompt = f"""논문 "{paper_info.get('title','Unknown')}"의 섹션별 요약이 아래에 있습니다:
 
-위 정보를 바탕으로 다음 형식으로 종합 분석을 작성해주세요:
+{combined}
 
-1. **핵심 요약** (3-4문장): 논문의 전체 내용을 가장 간결하게 요약
-2. **주요 기여점** (3-5개): 이 논문의 핵심 기여를 bullet point로
-3. **방법론**: 사용된 주요 방법과 접근법
-4. **주요 결과**: 핵심 실험 결과와 성능
-5. **의의 및 한계**: 연구의 의의와 한계점
-6. **관련성 점수** (1-10): AI/ML 분야에서의 중요도와 영향력
-7. **키워드** (3-5개): 이 논문을 대표하는 키워드
+아래 JSON 스키마에 맞게 결과만 JSON으로 출력하세요(설명문 금지):
+{json.dumps(format_hint, ensure_ascii=False, indent=2)}
 
-한국어로 작성하되, 전문 용어는 영어를 병기해주세요."""
+규칙:
+- key_contributions: 3~6개 bullet 수준의 간결 문장
+- relevance_score: 1~10 정수
+- tags: 5~8개 짧은 표제어 (영문)
+- 전문 용어는 English 그대로 유지
+"""
+    msgs = [
+        {"role": "system", "content": "You are an expert AI/ML researcher. Return ONLY valid JSON."},
+        {"role": "user", "content": final_prompt},
+    ]
+    final_out = call_llm(msgs, max_tokens=min(2500, LLM_MAX_TOKENS))
+    parsed = _json_extract(final_out) or {}
 
-        messages = [
-            {"role": "system", "content": "당신은 AI/ML 분야의 선임 연구원입니다. 논문을 깊이 있게 분석하고 실무적 관점에서 평가합니다."},
-            {"role": "user", "content": final_prompt}
-        ]
-        
-        final_analysis = call_llm(messages, max_tokens=2500)
-        
-        # Parse the response (simple parsing, can be enhanced)
-        analysis = PaperAnalysis(
-            title=paper_info.get('title', 'Unknown'),
-            authors=paper_info.get('authors', []),
-            abstract=sections.get('abstract', '')[:500] if sections.get('abstract') else '',
-            summary=final_analysis,
-            key_contributions=[],  # Could parse from response
-            methodology=section_summaries.get('methods', ''),
-            results=section_summaries.get('results', ''),
-            relevance_score=8,  # Could parse from response
-            tags=[],  # Could parse from response
-            source_file=paper_info.get('s3_key', '')
-        )
-        
-        logger.info("Successfully analyzed paper with LLM")
-        return analysis
-        
-    except Exception as e:
-        logger.error(f"Error analyzing with LLM: {str(e)}")
-        raise
+    return PaperAnalysis(
+        title=paper_info.get("title","Unknown"),
+        authors=paper_info.get("authors", []),
+        abstract=(sections.get("abstract","")[:800] if sections.get("abstract") else ""),
+        summary=final_out if isinstance(final_out, str) else json.dumps(final_out, ensure_ascii=False),
+        key_contributions=parsed.get("key_contributions", []),
+        methodology=parsed.get("methodology", section_summaries.get("methods","")),
+        results=parsed.get("results", section_summaries.get("results","")),
+        relevance_score=int(parsed.get("relevance_score", 7)),
+        tags=parsed.get("tags", []),
+        source_file=paper_info.get("s3_key",""),
+    )
 
+# ===== Confluence (optional) =====
+def _conf_get_page_by_title(title: str) -> Optional[Dict]:
+    url = f"{CONFLUENCE_URL}/rest/api/content"
+    params = {"title": title, "spaceKey": CONFLUENCE_SPACE_KEY, "expand": "version"}
+    r = requests.get(url, params=params, auth=(CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN), timeout=30)
+    r.raise_for_status()
+    res = r.json().get("results", [])
+    return res[0] if res else None
+
+def _conf_escape(s: str) -> str:
+    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 def upload_to_confluence(analyses: List[PaperAnalysis], page_title: str):
-    """Upload paper analyses to Confluence"""
     logger.info(f"Uploading to Confluence: {page_title}")
-    
-    # Build Confluence page content
-    content = f"""<h1>AI Paper Newsletter - {datetime.now().strftime('%Y-%m-%d')}</h1>
-<p>이번 주의 주목할 만한 AI 논문들을 소개합니다.</p>
+    body = [f"<h1>AI Paper Newsletter - {datetime.now().strftime('%Y-%m-%d')}</h1>",
+            "<p>이번 주의 주목할 만한 AI 논문들을 소개합니다.</p>",
+            '<ac:structured-macro ac:name="info"><ac:rich-text-body>',
+            f"<p>총 {len(analyses)}편의 논문이 분석되었습니다.</p>",
+            "</ac:rich-text-body></ac:structured-macro><hr/>"]
+    for i, a in enumerate(analyses, 1):
+        body.append(f"<h2>{i}. {_conf_escape(a.title)}</h2>")
+        if a.authors:
+            body.append(f"<p><strong>Authors:</strong> {_conf_escape(', '.join(a.authors[:8]))}</p>")
+        if a.tags:
+            body.append(f"<p><strong>Tags:</strong> {_conf_escape(', '.join(a.tags))}</p>")
+        if a.abstract:
+            body.append("<h3>Abstract</h3><p>" + _conf_escape(a.abstract) + "</p>")
+        body.append("<h3>Analysis</h3>")
+        body.append(a.summary)
+        body.append(f"<p><em>Source:</em> s3://{a.source_file}</p>")
+        body.append("<hr/>")
+    content_html = "\n".join(body)
 
-<ac:structured-macro ac:name="info">
-<ac:rich-text-body>
-<p>총 {len(analyses)}편의 논문이 분석되었습니다.</p>
-</ac:rich-text-body>
-</ac:structured-macro>
-
-<hr/>
-"""
-    
-    for i, analysis in enumerate(analyses, 1):
-        content += f"""
-<h2>{i}. {analysis.title}</h2>
-<p><strong>저자:</strong> {', '.join(analysis.authors[:5])}</p>
-
-<h3>초록</h3>
-<p>{analysis.abstract[:500]}...</p>
-
-<h3>분석</h3>
-{analysis.summary}
-
-<hr/>
-"""
-    
-    # Confluence API
-    url = f"{CONFLUENCE_URL}/rest/api/content"
-    headers = {
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "type": "page",
-        "title": page_title,
-        "space": {"key": CONFLUENCE_SPACE_KEY},
-        "body": {
-            "storage": {
-                "value": content,
-                "representation": "storage"
-            }
-        }
-    }
-    
+    create_url = f"{CONFLUENCE_URL}/rest/api/content"
+    headers = {"Content-Type": "application/json"}
     try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            auth=(CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN)
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        page_url = f"{CONFLUENCE_URL}{result['_links']['webui']}"
-        logger.info(f"Successfully uploaded to Confluence: {page_url}")
-        
-        return {"success": True, "page_url": page_url, "page_id": result['id']}
-        
+        existing = _conf_get_page_by_title(page_title)
+        if existing:
+            page_id = existing["id"]
+            version = existing.get("version", {}).get("number", 1) + 1
+            payload = {
+                "id": page_id, "type": "page", "title": page_title,
+                "space": {"key": CONFLUENCE_SPACE_KEY},
+                "body": {"storage": {"value": content_html, "representation": "storage"}},
+                "version": {"number": version},
+            }
+            r = requests.put(f"{create_url}/{page_id}", json=payload, headers=headers,
+                             auth=(CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN), timeout=60)
+            r.raise_for_status()
+            result = r.json()
+        else:
+            payload = {
+                "type": "page", "title": page_title, "space": {"key": CONFLUENCE_SPACE_KEY},
+                "body": {"storage": {"value": content_html, "representation": "storage"}},
+            }
+            r = requests.post(create_url, json=payload, headers=headers,
+                              auth=(CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN), timeout=60)
+            r.raise_for_status()
+            result = r.json()
+
+        base = CONFLUENCE_URL.rstrip("/")
+        webui = result.get("_links", {}).get("webui")
+        tiny = result.get("_links", {}).get("tinyui")
+        page_url = f"{base}{webui}" if webui else (f"{base}{tiny}" if tiny else f"{base}/pages/{result['id']}")
+        logger.info(f"Confluence page: {page_url}")
+        return {"success": True, "page_url": page_url, "page_id": result["id"]}
     except Exception as e:
-        logger.error(f"Error uploading to Confluence: {str(e)}")
+        logger.exception("Confluence upload error")
         raise
 
+# ===== Markdown builder =====
+def derive_week_label(prefix: str) -> str:
+    m = re.search(r"w(\d{1,2})", prefix or "", re.IGNORECASE)
+    if m:
+        return f"w{int(m.group(1))}"
+    iso_year, iso_week, _ = datetime.utcnow().isocalendar()
+    return f"w{iso_week}"
+
+def build_markdown(analyses: List[PaperAnalysis], week_label: str, prefix: str) -> Tuple[str, str]:
+    if not week_label:
+        week_label = derive_week_label(prefix)
+    header = textwrap.dedent(f"""\
+    # AI Paper Newsletter – {week_label}
+    _Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_
+
+    Source prefix: `{prefix}`
+
+    ---
+    """)
+    parts = [header]
+    for i, a in enumerate(analyses, 1):
+        tags = f"**Tags:** {', '.join(a.tags)}" if a.tags else ""
+        authors = f"**Authors:** {', '.join(a.authors[:8])}" if a.authors else ""
+        abstract_block = ""
+        if a.abstract and a.abstract.strip():
+            abstract_block = "\n**Abstract**\n\n> " + a.abstract.strip() + "\n"
+        sec = textwrap.dedent(f"""\
+        ## {i}. {a.title}
+        {authors}
+        {tags}
+
+        **Summary**
+        {a.summary.strip()}
+
+        {abstract_block}**Source:** `s3://{a.source_file}`
+
+        ---
+        """)
+        parts.append(sec)
+    md_content = "\n".join(parts)
+    md_filename = f"{week_label}.md"
+    return md_filename, md_content
+
+# ===== Routes =====
+@app.get("/")
+async def root():
+    return {
+        "service": "AI Paper Newsletter Processor",
+        "status": "running",
+        "available_endpoints": ["/health", "/list-s3-papers", "/process-s3-papers"],
+    }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy", 
-        "timestamp": datetime.now().isoformat(),
-        "mode": "S3-only (internal)"
-    }
-
-
-@app.post("/process-s3-papers")
-async def process_s3_papers(request: S3PapersRequest):
-    """Process papers from S3 bucket - Main endpoint"""
-    logger.info("Processing S3 papers")
-    
-    bucket = request.bucket or S3_BUCKET
-    prefix = request.prefix or S3_PAPERS_PREFIX
-    
-    try:
-        # 1. Get papers from S3
-        papers = get_s3_papers(
-            bucket=bucket, 
-            prefix=prefix,
-            file_pattern=request.file_pattern,
-            process_subdirectories=request.process_subdirectories
-        )
-        
-        if not papers:
-            return {
-                "message": "No papers found in S3",
-                "papers_processed": 0,
-                "bucket": bucket,
-                "prefix": prefix
-            }
-        
-        # 2. Process each paper
-        analyses = []
-        errors = []
-        
-        for paper in papers:
-            try:
-                logger.info(f"Processing: {paper['title']}")
-                
-                # Download from S3
-                pdf_path = download_pdf_from_s3(
-                    s3_key=paper['s3_key'],
-                    s3_bucket=paper['s3_bucket']
-                )
-                
-                # Parse with Docpamin API
-                markdown_content, json_metadata = parse_pdf_with_docpamin(pdf_path)
-                
-                # Analyze with LLM (hierarchical summarization)
-                paper_info = {
-                    "title": paper['title'],
-                    "authors": [],
-                    "abstract": "",
-                    "s3_key": paper['s3_key']
-                }
-                analysis = analyze_paper_with_llm(paper_info, markdown_content, json_metadata)
-                analysis.source_file = paper['s3_key']
-                analyses.append(analysis)
-                
-                # Cleanup
-                os.unlink(pdf_path)
-                
-                logger.info(f"Successfully processed: {paper['title']}")
-                
-            except Exception as e:
-                error_msg = f"Error processing {paper['title']}: {str(e)}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-                continue
-        
-        # 3. Upload to Confluence if we have analyses
-        confluence_result = None
-        if analyses:
-            page_title = f"AI Paper Newsletter - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            confluence_result = upload_to_confluence(analyses, page_title)
-        
-        return {
-            "message": "Successfully processed S3 papers",
-            "papers_found": len(papers),
-            "papers_processed": len(analyses),
-            "errors": errors,
-            "bucket": bucket,
-            "prefix": prefix,
-            "confluence_url": confluence_result.get("page_url") if confluence_result else None
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in process_s3_papers: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/batch-process")
-async def batch_process_papers(request: BatchProcessRequest):
-    """Batch process papers with custom settings"""
-    logger.info("Batch processing papers")
-    
-    bucket = request.bucket or S3_BUCKET
-    prefix = request.prefix or S3_PAPERS_PREFIX
-    
-    try:
-        # Get and process papers
-        papers = get_s3_papers(bucket, prefix)
-        
-        if not papers:
-            return {
-                "message": "No papers found in S3",
-                "papers_processed": 0
-            }
-        
-        analyses = []
-        for paper in papers:
-            try:
-                pdf_path = download_pdf_from_s3(
-                    s3_key=paper['s3_key'],
-                    s3_bucket=paper['s3_bucket']
-                )
-                
-                markdown_content, json_metadata = parse_pdf_with_docpamin(pdf_path)
-                
-                paper_info = {
-                    "title": paper['title'],
-                    "authors": [],
-                    "abstract": "",
-                    "s3_key": paper['s3_key']
-                }
-                analysis = analyze_paper_with_llm(paper_info, markdown_content, json_metadata)
-                analysis.source_file = paper['s3_key']
-                analysis.tags = request.tags
-                analyses.append(analysis)
-                
-                os.unlink(pdf_path)
-                
-            except Exception as e:
-                logger.error(f"Error processing paper: {str(e)}")
-                continue
-        
-        # Upload to Confluence
-        page_title = request.confluence_page_title or f"AI Paper Review - {datetime.now().strftime('%Y-%m-%d')}"
-        confluence_result = upload_to_confluence(analyses, page_title)
-        
-        return {
-            "message": "Successfully batch processed papers",
-            "papers_found": len(papers),
-            "papers_processed": len(analyses),
-            "confluence_url": confluence_result.get("page_url")
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in batch_process: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "mode": "S3-only (internal)"}
 
 @app.get("/list-s3-papers")
 async def list_s3_papers(bucket: Optional[str] = None, prefix: Optional[str] = None):
-    """List available papers in S3 without processing"""
     bucket = bucket or S3_BUCKET
     prefix = prefix or S3_PAPERS_PREFIX
-    
     try:
         papers = get_s3_papers(bucket, prefix)
-        
         return {
             "bucket": bucket,
             "prefix": prefix,
             "papers_found": len(papers),
             "papers": [
-                {
-                    "title": p['title'],
-                    "s3_key": p['s3_key'],
-                    "last_modified": p['last_modified'],
-                    "size_bytes": p.get('size_bytes', 0)
-                }
+                {"title": p["title"], "s3_key": p["s3_key"], "last_modified": p["last_modified"], "size_bytes": p.get("size_bytes", 0)}
                 for p in papers
-            ]
+            ],
         }
     except Exception as e:
-        logger.error(f"Error listing S3 papers: {str(e)}")
+        logger.error(f"list_s3_papers error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/process-s3-papers")
+async def process_s3_papers(request: S3PapersRequest):
+    logger.info("Processing S3 papers")
+    bucket = request.bucket or S3_BUCKET
+    prefix = request.prefix or S3_PAPERS_PREFIX
+    try:
+        papers = get_s3_papers(
+            bucket=bucket,
+            prefix=prefix,
+            file_pattern=request.file_pattern or "*.pdf",
+            process_subdirectories=request.process_subdirectories,
+        )
+        if not papers:
+            return {
+                "message": "No papers found in S3",
+                "papers_found": 0,
+                "papers_processed": 0,
+                "bucket": bucket,
+                "prefix": prefix,
+                "md_filename": None,
+                "md_content": "",
+            }
+
+        def _process_one(p: Dict) -> Tuple[Optional[PaperAnalysis], Optional[str]]:
+            tmp = None
+            try:
+                tmp = download_pdf_from_s3(p["s3_key"], p["s3_bucket"])
+                md, meta = parse_pdf_with_docpamin(tmp)
+                info = {"title": p["title"], "authors": [], "abstract": "", "s3_key": p["s3_key"]}
+                a = analyze_paper_with_llm(info, md, meta)
+                a.source_file = p["s3_key"]
+                return a, None
+            except Exception as e:
+                return None, f"{p['s3_key']}: {e}"
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try: os.unlink(tmp)
+                    except Exception: pass
+
+        analyses: List[PaperAnalysis] = []
+        errors: List[str] = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = [ex.submit(_process_one, p) for p in papers]
+            for fut in as_completed(futs):
+                a, err = fut.result()
+                if a: analyses.append(a)
+                if err: errors.append(err)
+
+        week_label = request.week_label or derive_week_label(prefix)
+        md_filename, md_content = build_markdown(analyses, week_label, prefix)
+
+        confluence_result = None
+        if request.upload_confluence and analyses:
+            page_title = f"AI Paper Newsletter - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            confluence_result = upload_to_confluence(analyses, page_title)
+
+        return {
+            "message": "Processed",
+            "papers_found": len(papers),
+            "papers_processed": len(analyses),
+            "errors": errors,
+            "bucket": bucket,
+            "prefix": prefix,
+            "week_label": week_label,
+            "md_filename": md_filename,
+            "md_content": md_content,
+            "confluence_url": (confluence_result or {}).get("page_url"),
+        }
+    except Exception as e:
+        logger.exception("process_s3_papers error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/batch-process")
+async def batch_process_papers(request: BatchProcessRequest):
+    logger.info("Batch processing papers")
+    bucket = request.bucket or S3_BUCKET
+    prefix = request.prefix or S3_PAPERS_PREFIX
+    try:
+        papers = get_s3_papers(bucket, prefix)
+        if not papers:
+            return {"message": "No papers found in S3", "papers_processed": 0}
+
+        analyses: List[PaperAnalysis] = []
+        for p in papers:
+            tmp = None
+            try:
+                tmp = download_pdf_from_s3(p["s3_key"], p["s3_bucket"])
+                md, meta = parse_pdf_with_docpamin(tmp)
+                info = {"title": p["title"], "authors": [], "abstract": "", "s3_key": p["s3_key"]}
+                a = analyze_paper_with_llm(info, md, meta)
+                a.source_file = p["s3_key"]
+                a.tags = request.tags
+                analyses.append(a)
+            except Exception as e:
+                logger.error(f"Error processing: {e}")
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try: os.unlink(tmp)
+                    except Exception: pass
+
+        page_title = request.confluence_page_title or f"AI Paper Review - {datetime.now().strftime('%Y-%m-%d')}"
+        confluence_result = upload_to_confluence(analyses, page_title)
+        return {
+            "message": "Successfully batch processed papers",
+            "papers_found": len(papers),
+            "papers_processed": len(analyses),
+            "confluence_url": confluence_result.get("page_url"),
+        }
+    except Exception as e:
+        logger.exception("batch_process error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7070)
+    uvicorn.run("paper_processor:app", host="0.0.0.0", port=7070, reload=False, workers=2)

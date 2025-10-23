@@ -1,0 +1,265 @@
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "4b7db7a7-5846-44fa-860c-6bbf92ed02bc",
+      "name": "수동 실행",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1200,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": " {\n   \"bucket\": \"aip-llm\",\n   \"prefix\": \"kai_papers/\"\n }",
+        "options": {}
+      },
+      "id": "43b96086-6ae6-471b-ba57-8d251654ab82",
+      "name": "S3 설정",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -976,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=http://10.166.249.91:7070/list-s3-papers",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "bucket",
+              "value": "={{ $json.bucket }}"
+            },
+            {
+              "name": "prefix",
+              "value": "={{ $json.prefix }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "011c174d-893f-482e-9bbf-d8f8f30d7c03",
+      "name": "논문 목록 조회",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -752,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.papers_found }}",
+              "operation": "larger"
+            }
+          ]
+        }
+      },
+      "id": "0e1a93e3-5531-4a28-ab62-dfc91689ce05",
+      "name": "논문 확인",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -528,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://paper-processor:8000/process-s3-papers",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"bucket\": \"{{ $('S3 설정').item.json.bucket }}\",\n  \"prefix\": \"{{ $('S3 설정').item.json.prefix }}\",\n  \"file_pattern\": \"*.pdf\",\n  \"process_subdirectories\": true\n}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "6b273dc6-c281-4e26-9c86-ad8c8681b7d2",
+      "name": "논문 처리",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -304,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.papers_processed }}",
+              "operation": "larger"
+            }
+          ]
+        }
+      },
+      "id": "ea9e9620-962d-4a6d-bed3-132124478015",
+      "name": "처리 결과 확인",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage"
+      },
+      "id": "5d7c3c69-282c-49e6-bbc2-8d3c4941e751",
+      "name": "성공 알림",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        144,
+        0
+      ],
+      "webhookId": "1c097b58-6628-47fc-ab78-c0f5153f61f9",
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage"
+      },
+      "id": "c2a42d79-c1c5-47bb-b8ee-86b8d6adabdb",
+      "name": "실패 알림",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        144,
+        192
+      ],
+      "webhookId": "7b10725c-b3a7-4296-a769-ae2618fa0493",
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage"
+      },
+      "id": "53eb481c-fb95-48cd-ac4a-36e0a1d684b1",
+      "name": "논문 없음 알림",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        -304,
+        288
+      ],
+      "webhookId": "2b8fc572-39b4-48af-9879-18c35dab814e",
+      "credentials": {}
+    }
+  ],
+  "connections": {
+    "수동 실행": {
+      "main": [
+        [
+          {
+            "node": "S3 설정",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "S3 설정": {
+      "main": [
+        [
+          {
+            "node": "논문 목록 조회",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "논문 목록 조회": {
+      "main": [
+        [
+          {
+            "node": "논문 확인",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "논문 확인": {
+      "main": [
+        [
+          {
+            "node": "논문 처리",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "논문 없음 알림",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "논문 처리": {
+      "main": [
+        [
+          {
+            "node": "처리 결과 확인",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "처리 결과 확인": {
+      "main": [
+        [
+          {
+            "node": "성공 알림",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "실패 알림",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "47166031170a48a31767ca465d7b21df7a22ea3ffc18747c9dff381493c0c365"
+  }
+}
