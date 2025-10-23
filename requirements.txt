@@ -1,0 +1,22 @@
+# FastAPI and web server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# AWS
+boto3
+botocore
+
+# HTTP requests (for Docpamin API and LLM API)
+requests
+
+# Confluence
+atlassian-python-api
+
+# Utilities
+python-dotenv
+pydantic
+pydantic-settings
+
+# Logging
+python-json-logger
