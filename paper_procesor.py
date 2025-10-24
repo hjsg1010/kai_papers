@@ -8,8 +8,8 @@ AI Paper Newsletter Processor (S3-only, Markdown + Git-ready)
 - n8n에서 md를 받아 Git에 업로드 가능
 """
 
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Tuple, Iterable
 from datetime import datetime
 from pathlib import Path
@@ -33,10 +33,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="AI Paper Newsletter Processor - Internal",
-    description="Processes AI papers from S3, parses via Docpamin, summarizes with LLM, returns Markdown.",
-    version="1.1.0",
+    title="AI Paper Newsletter Processor",
+    description="Processes AI papers from S3, parses with Docpamin, summarizes via LLM.",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url=None,
+    openapi_url="/openapi.json",
+    root_path="/proxy/7070",   # ★ 고정 프리픽스
 )
+
 
 # ===== Configuration (env) =====
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
@@ -101,12 +106,41 @@ class PaperAnalysis(BaseModel):
     tags: List[str]
     source_file: str  # S3 key
 
+# ==== [요청/응답 모델] ====
+class DebugParseS3Request(BaseModel):
+    bucket: Optional[str] = None
+    key: str
+    include_markdown: bool = False
+    markdown_max_chars: int = 5000
+
+class DebugSummarizeMarkdownRequest(BaseModel):
+    title: str = "Untitled Paper"
+    markdown: str
+    include_section_summaries: bool = True
+    include_final_analysis: bool = True
+    return_markdown_preview_chars: int = 0  # 0이면 미포함
+
+class DebugSummarizeSectionsRequest(BaseModel):
+    title: str = "Untitled Paper"
+    sections: Dict[str, str] = Field(
+        default_factory=dict,
+        description="{'abstract': '...', 'introduction': '...', ...}"
+    )
+    only_sections: Optional[List[str]] = None  # 특정 섹션만 요약하고 싶으면 지정
+
 # ===== Utilities =====
 def _iter_s3_objects(bucket: str, prefix: str) -> Iterable[Dict]:
     paginator = s3_client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             yield obj
+
+def _preview(text: str, limit: int) -> str: # 미리보기 잘라내기
+    if not text or limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...\n(truncated)"
 
 def get_s3_papers(
     bucket: str,
@@ -632,6 +666,146 @@ async def batch_process_papers(request: BatchProcessRequest):
     except Exception as e:
         logger.exception("batch_process error")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==== [1] 로컬 파일 업로드 → 파싱 테스트 ====
+@app.post("/debug/parse-file")
+async def debug_parse_file(
+    file: UploadFile = File(...),
+    include_markdown: bool = Form(False),
+    markdown_max_chars: int = Form(5000),
+):
+    """
+    로컬에서 PDF만 업로드해서 Docpamin 파싱을 테스트할 수 있는 디버그 엔드포인트.
+    multipart/form-data로 파일 업로드.
+    """
+    # 임시 저장
+    suffix = Path(file.filename).suffix or ".pdf"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        content = await file.read()
+        tmp.write(content)
+        tmp.close()
+
+        md, meta = parse_pdf_with_docpamin(tmp.name)
+        resp = {
+            "filename": file.filename,
+            "md_len": len(md),
+            "md_preview": _preview(md, markdown_max_chars),
+            "metadata": meta,
+        }
+        if include_markdown:
+            resp["markdown"] = md
+        return resp
+    finally:
+        try:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+        except Exception:
+            pass
+
+# ==== [2] S3 단일 객체 key → 파싱 테스트 ====
+@app.post("/debug/parse-s3")
+async def debug_parse_s3(req: DebugParseS3Request):
+    """
+    S3의 특정 key만 Docpamin 파싱 테스트.
+    """
+    bucket = req.bucket or S3_BUCKET
+    if not bucket:
+        raise HTTPException(status_code=400, detail="Bucket is required (env S3_BUCKET_NAME or request.bucket)")
+    # 다운로드 후 파싱
+    tmp = None
+    try:
+        tmp = download_pdf_from_s3(s3_key=req.key, s3_bucket=bucket)
+        md, meta = parse_pdf_with_docpamin(tmp)
+        resp = {
+            "bucket": bucket,
+            "key": req.key,
+            "md_len": len(md),
+            "md_preview": _preview(md, req.markdown_max_chars),
+            "metadata": meta,
+        }
+        if req.include_markdown:
+            resp["markdown"] = md
+        return resp
+    finally:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+
+# ==== [3] Markdown 텍스트 → 섹션/최종 요약 테스트 ====
+@app.post("/debug/summarize-markdown")
+async def debug_summarize_markdown(req: DebugSummarizeMarkdownRequest):
+    """
+    임의의 markdown 문자열을 입력받아:
+      - 섹션 분해 (abstract/introduction/methods/results/...)
+      - 섹션별 요약 (옵션)
+      - 최종 종합 분석(LLM) (옵션)
+    을 수행.
+    """
+    if not req.markdown or not req.markdown.strip():
+        raise HTTPException(status_code=400, detail="markdown is empty")
+
+    sections = extract_sections_from_markdown(req.markdown)
+
+    section_summaries = {}
+    if req.include_section_summaries:
+        for sec_name, sec_text in sections.items():
+            if not sec_text.strip():
+                continue
+            section_summaries[sec_name] = summarize_section(sec_name, sec_text, req.title)
+
+    final_analysis = None
+    if req.include_final_analysis:
+        # analyze_paper_with_llm는 내부에서 섹션 요약을 다시 수행하지만,
+        # 이미 섹션 요약이 있다면 더 빠르게 하려면 별도 경로를 만들어도 됨.
+        paper_info = {"title": req.title, "authors": [], "abstract": "", "s3_key": ""}
+        final = analyze_paper_with_llm(paper_info, req.markdown, {})
+        # Pydantic 모델 → dict
+        final_analysis = {
+            "title": final.title,
+            "authors": final.authors,
+            "abstract": final.abstract,
+            "summary": final.summary,
+            "key_contributions": final.key_contributions,
+            "methodology": final.methodology,
+            "results": final.results,
+            "relevance_score": final.relevance_score,
+            "tags": final.tags,
+        }
+
+    return {
+        "title": req.title,
+        "sections_detected": [k for k, v in sections.items() if v.strip()],
+        "section_summaries": section_summaries if req.include_section_summaries else {},
+        "final_analysis": final_analysis,
+        "markdown_preview": _preview(req.markdown, req.return_markdown_preview_chars),
+    }
+
+# ==== [4] 섹션 dict → 섹션 요약만 테스트 ====
+@app.post("/debug/summarize-sections")
+async def debug_summarize_sections(req: DebugSummarizeSectionsRequest):
+    """
+    섹션 dict(예: {'abstract': '...', 'results': '...'})을 넣어서
+    섹션 요약만 빠르게 테스트.
+    """
+    if not req.sections:
+        raise HTTPException(status_code=400, detail="sections is empty")
+
+    targets = req.only_sections or list(req.sections.keys())
+    out: Dict[str, str] = {}
+    for sec in targets:
+        text = req.sections.get(sec, "")
+        if not text.strip():
+            continue
+        out[sec] = summarize_section(sec, text, req.title)
+
+    return {
+        "title": req.title,
+        "summarized_sections": list(out.keys()),
+        "summaries": out,
+    }
 
 if __name__ == "__main__":
     import uvicorn
