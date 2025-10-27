@@ -6,6 +6,14 @@ AI Paper Newsletter Processor (S3-only, Markdown + Git-ready)
 - Markdown 문서 생성 (wNN.md)
 - (옵션) Confluence 업로드
 - n8n에서 md를 받아 Git에 업로드 가능
+
+[개선사항 v2 - 하이브리드 청킹]
+- Smart Hybrid Chunking: 헤더 개수에 따라 자동 선택
+  - 헤더 5개 이상 → 섹션 기반 (모든 헤더 추출)
+  - 헤더 5개 미만 → 토큰 기반 (균등 분할)
+- Overlap chunking으로 맥락 보존
+- Hierarchical summarization (위치 기반: beginning/middle/end)
+- Sliding window with context
 """
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
@@ -28,20 +36,22 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import textwrap
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AI Paper Newsletter Processor",
-    description="Processes AI papers from S3, parses with Docpamin, summarizes via LLM.",
-    version="1.0.0",
+    description="Processes AI papers from S3, parses with Docpamin, summarizes via LLM. v2: Smart Hybrid Chunking (header-based or token-based)",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url=None,
     openapi_url="/openapi.json",
-    root_path="/proxy/7070",   # ★ 고정 프리픽스
+    root_path="/proxy/7070",
 )
-
 
 # ===== Configuration (env) =====
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
@@ -53,10 +63,16 @@ DOCPAMIN_API_KEY = os.getenv("DOCPAMIN_API_KEY")
 DOCPAMIN_BASE_URL = os.getenv("DOCPAMIN_BASE_URL", "https://docpamin.superaip.samsungds.net/api/v1")
 DOCPAMIN_CRT_FILE = os.getenv("DOCPAMIN_CRT_FILE", "/etc/ssl/certs/ca-certificates.crt")
 
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+# LLM_API_KEY = os.getenv("LLM_API_KEY")
+# LLM_BASE_URL = os.getenv("LLM_BASE_URL")
+# LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+# LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "10000"))
+
+LLM_API_KEY="sk-1234"
+LLM_BASE_URL="http://10.166.249.91:4000/v1"
+LLM_MODEL="openai/gpt-oss-120b"
+LLM_MAX_TOKENS=10000
+# print(f"=================\n\n{LLM_API_KEY}\n{LLM_BASE_URL}\n{LLM_MODEL}\n\n\n\n\n==================================")
 
 CONFLUENCE_URL = os.getenv("CONFLUENCE_URL")
 CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL")
@@ -65,7 +81,7 @@ CONFLUENCE_SPACE_KEY = os.getenv("CONFLUENCE_SPACE_KEY")
 
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
 
-# ===== boto3 client (retry/timeout tuned) =====
+# ===== boto3 client =====
 boto_config = Config(
     retries={"max_attempts": 5, "mode": "standard"},
     connect_timeout=10,
@@ -84,9 +100,11 @@ class S3PapersRequest(BaseModel):
     prefix: Optional[str] = None
     file_pattern: Optional[str] = "*.pdf"
     process_subdirectories: bool = True
-    # 신규 옵션
     week_label: Optional[str] = None
     upload_confluence: Optional[bool] = False
+    # 개선 옵션
+    use_hierarchical: bool = True  # 계층적 요약 사용
+    use_overlap: bool = True  # overlap chunking 사용
 
 class BatchProcessRequest(BaseModel):
     bucket: Optional[str] = None
@@ -104,9 +122,8 @@ class PaperAnalysis(BaseModel):
     results: str
     relevance_score: int
     tags: List[str]
-    source_file: str  # S3 key
+    source_file: str
 
-# ==== [요청/응답 모델] ====
 class DebugParseS3Request(BaseModel):
     bucket: Optional[str] = None
     key: str
@@ -118,15 +135,18 @@ class DebugSummarizeMarkdownRequest(BaseModel):
     markdown: str
     include_section_summaries: bool = True
     include_final_analysis: bool = True
-    return_markdown_preview_chars: int = 0  # 0이면 미포함
+    return_markdown_preview_chars: int = 0
+    # 개선 옵션
+    use_hierarchical: bool = True
+    use_overlap: bool = True
+    show_intermediate_steps: bool = False  # 중간 단계 출력
 
 class DebugSummarizeSectionsRequest(BaseModel):
     title: str = "Untitled Paper"
-    sections: Dict[str, str] = Field(
-        default_factory=dict,
-        description="{'abstract': '...', 'introduction': '...', ...}"
-    )
-    only_sections: Optional[List[str]] = None  # 특정 섹션만 요약하고 싶으면 지정
+    sections: Dict[str, str] = Field(default_factory=dict)
+    only_sections: Optional[List[str]] = None
+    # 개선 옵션
+    use_overlap: bool = True
 
 # ===== Utilities =====
 def _iter_s3_objects(bucket: str, prefix: str) -> Iterable[Dict]:
@@ -135,7 +155,7 @@ def _iter_s3_objects(bucket: str, prefix: str) -> Iterable[Dict]:
         for obj in page.get("Contents", []):
             yield obj
 
-def _preview(text: str, limit: int) -> str: # 미리보기 잘라내기
+def _preview(text: str, limit: int) -> str:
     if not text or limit <= 0:
         return ""
     if len(text) <= limit:
@@ -150,12 +170,11 @@ def get_s3_papers(
     min_size_bytes: int = 1024,
     max_size_bytes: int = 1024 * 1024 * 100,
 ) -> List[Dict]:
-    logger.info(f"Fetching papers from S3: s3://{bucket}/{prefix} (pattern={file_pattern})")
+    logger.info(f"Fetching papers from S3: s3://{bucket}/{prefix}")
     papers = []
     for obj in _iter_s3_objects(bucket, prefix):
         key = obj["Key"]
         rel = key[len(prefix):].lstrip("/") if key.startswith(prefix) else key
-
         if not fnmatch.fnmatch(rel, file_pattern):
             continue
         if not process_subdirectories and "/" in rel:
@@ -163,7 +182,6 @@ def get_s3_papers(
         size = obj.get("Size", 0)
         if size < min_size_bytes or size > max_size_bytes:
             continue
-
         papers.append({
             "title": Path(key).stem.replace("_", " ").replace("-", " "),
             "s3_key": key,
@@ -172,8 +190,7 @@ def get_s3_papers(
             "size_bytes": size,
             "source": "s3",
         })
-
-    logger.info(f"Found {len(papers)} papers in S3 (after filtering)")
+    logger.info(f"Found {len(papers)} papers in S3")
     return papers
 
 def download_pdf_from_s3(s3_key: str, s3_bucket: str) -> str:
@@ -219,14 +236,12 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
             raise Exception("Docpamin: no task_id returned")
 
         logger.info(f"Docpamin task: {task_id}")
-        # Poll
         max_wait, waited, backoff = 600, 0, 2
         while waited < max_wait:
             s = session.get(f"{DOCPAMIN_BASE_URL}/tasks/{task_id}",
                             verify=DOCPAMIN_CRT_FILE, timeout=REQ_TIMEOUT)
             s.raise_for_status()
             status = s.json().get("status")
-            logger.info(f"Docpamin status={status}")
             if status == "DONE":
                 break
             if status in {"FAILED", "ERROR"}:
@@ -237,7 +252,6 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
         if waited >= max_wait:
             raise Exception("Docpamin timeout")
 
-        # Export
         opts = {"task_ids": [task_id], "output_types": ["markdown", "json"]}
         e = session.post(f"{DOCPAMIN_BASE_URL}/tasks/export", json=opts,
                          verify=DOCPAMIN_CRT_FILE, timeout=REQ_TIMEOUT)
@@ -266,13 +280,17 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
 
 # ===== LLM utils =====
 def _estimate_tokens(s: str) -> int:
+    """간단한 토큰 추정 (1 token ≈ 4 chars)"""
     return max(1, math.ceil(len(s) / 4))
 
 def call_llm(messages: List[Dict], max_tokens: int = 2000) -> str:
+    """LLM API 호출"""
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": LLM_MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2}
+    # print(f"==================================\n {payload}")
     try:
-        r = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=120)
+        base_url = LLM_BASE_URL.rstrip('/')
+        r = requests.post(f"http://10.166.249.91:4000/v1/chat/completions", headers=headers, json=payload, timeout=120)
         r.raise_for_status()
         j = r.json()
         return j["choices"][0]["message"]["content"]
@@ -280,75 +298,294 @@ def call_llm(messages: List[Dict], max_tokens: int = 2000) -> str:
         logger.error(f"LLM call failed: {e}")
         raise
 
-def extract_sections_from_markdown(markdown_content: str) -> Dict[str, str]:
-    logger.info("Extracting sections from markdown...")
-    sections = {k: "" for k in ["abstract","introduction","methods","results","discussion","conclusion","other"]}
-    header_map = {
-        "abstract": r"^#{1,3}\s*(abstract|요약)\b",
-        "introduction": r"^#{1,3}\s*(introduction|서론|배경)\b",
-        "methods": r"^#{1,3}\s*(methods?|methodology|approach|방법)\b",
-        "results": r"^#{1,3}\s*(results?|experiments?|결과|실험)\b",
-        "discussion": r"^#{1,3}\s*(discussion|analysis|분석|논의)\b",
-        "conclusion": r"^#{1,3}\s*(conclusion|summary|결론|요약)\b",
-    }
-    current = "other"
-    buf: List[str] = []
+def extract_all_headers(markdown_content: str) -> Dict[str, str]:
+    """
+    섹션 이름에 관계없이 모든 헤더를 추출하여 섹션으로 분리
+    """
+    logger.info("Extracting all headers from markdown...")
+    sections = []
+    current_section = {"header": "preamble", "level": 0, "content": []}
+    
     for line in markdown_content.splitlines():
-        matched = None
-        for sec, pat in header_map.items():
-            if re.search(pat, line.strip(), re.IGNORECASE):
-                matched = sec; break
-        if matched:
-            if buf:
-                sections[current] += "\n".join(buf) + "\n"
-                buf = []
-            current = matched
-        buf.append(line)
-    if buf:
-        sections[current] += "\n".join(buf)
-    for k, v in sections.items():
-        if v.strip():
-            logger.info(f"Section '{k}': {len(v)} chars, ~{_estimate_tokens(v)} toks")
-    return sections
+        # 헤더 감지 (# ~ ###)
+        header_match = re.match(r'^(#{1,3})\s+(.+)$', line.strip())
+        
+        if header_match:
+            # 이전 섹션 저장
+            if current_section["content"]:
+                sections.append(current_section)
+            
+            # 새 섹션 시작
+            level = len(header_match.group(1))
+            header = header_match.group(2).strip()
+            current_section = {
+                "header": header,
+                "level": level,
+                "content": []
+            }
+        else:
+            current_section["content"].append(line)
+    
+    # 마지막 섹션 저장
+    if current_section["content"]:
+        sections.append(current_section)
+    
+    # Dict로 변환 (키: section_N_header)
+    result = {}
+    for i, sec in enumerate(sections):
+        # 헤더를 키로 사용 (중복 방지를 위해 번호 추가)
+        header_clean = re.sub(r'[^\w\s-]', '', sec['header'])[:30]
+        key = f"section_{i:02d}_{header_clean}"
+        content = "\n".join(sec["content"])
+        
+        if content.strip():  # 빈 섹션 제외
+            result[key] = content
+            logger.info(f"Section '{sec['header']}': {len(content)} chars, ~{_estimate_tokens(content)} toks")
+    
+    return result
 
-def summarize_section(section_name: str, section_content: str, paper_title: str) -> str:
-    if not section_content.strip():
+def chunk_by_tokens(text: str, chunk_size: int = 4000, overlap: int = 400) -> List[str]:
+    """
+    토큰 기반으로 텍스트를 균등 분할
+    - 섹션 구조가 없거나 불명확할 때 사용
+    """
+    logger.info(f"Chunking by tokens (chunk_size={chunk_size}, overlap={overlap})...")
+    
+    total_chars = len(text)
+    if total_chars <= chunk_size * 4:  # 한 청크에 들어감
+        return [text]
+    
+    # 대략적인 문자 수 계산 (1 token ≈ 4 chars)
+    char_per_chunk = chunk_size * 4
+    overlap_chars = overlap * 4
+    
+    chunks = []
+    start = 0
+    
+    while start < total_chars:
+        end = start + char_per_chunk
+        
+        # 마지막 청크가 아니면 문장 경계에서 자르기
+        if end < total_chars:
+            # 마침표, 줄바꿈 등에서 자연스럽게 자르기
+            for i in range(end, max(start + char_per_chunk // 2, end - 500), -1):
+                if i < len(text) and text[i] in '.!?\n':
+                    end = i + 1
+                    break
+        
+        chunk = text[start:end]
+        chunks.append(chunk)
+        
+        # 다음 청크 시작 위치 (overlap 적용)
+        start = end - overlap_chars
+        
+        if start >= total_chars:
+            break
+    
+    logger.info(f"Created {len(chunks)} chunks by tokens")
+    return chunks
+
+def smart_chunk_hybrid(markdown_content: str, min_headers: int = 8) -> Tuple[Dict[str, str], str]:
+    """
+    하이브리드 청킹: 헤더 개수에 따라 방식 선택
+    
+    Returns:
+        (chunks_dict, method_used)
+        method_used: "header_based" or "token_based"
+    """
+    # 헤더 개수 확인
+    headers = re.findall(r'^#{1,3}\s+.+$', markdown_content, re.MULTILINE)
+    num_headers = len(headers)
+    
+    logger.info(f"Found {num_headers} headers in markdown")
+    
+    if num_headers >= min_headers:
+        # 충분한 헤더 → 헤더 기반 섹션 분리
+        logger.info(f"Using HEADER-BASED chunking ({num_headers} headers >= {min_headers})")
+        chunks = extract_all_headers(markdown_content)
+        return chunks, "header_based"
+    else:
+        # 헤더 부족 → 토큰 기반 균등 분할
+        logger.info(f"Using TOKEN-BASED chunking ({num_headers} headers < {min_headers})")
+        chunk_list = chunk_by_tokens(markdown_content, chunk_size=4000, overlap=400)
+        chunks = {f"chunk_{i:02d}": chunk for i, chunk in enumerate(chunk_list)}
+        return chunks, "token_based"
+
+# ===== 개선된 요약 함수들 =====
+
+def smart_chunk_with_overlap(text: str, chunk_size: int = 4000, overlap: int = 400) -> List[str]:
+    """
+    텍스트를 overlap을 가지고 청크로 분할
+    - chunk_size: 각 청크의 대략적인 크기 (문자 단위)
+    - overlap: 청크 간 겹치는 부분 (문자 단위)
+    """
+    if len(text) <= chunk_size:
+        return [text]
+    
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        
+        # 마지막 청크가 아니면 overlap 적용
+        if end < len(text):
+            # 문장 경계에서 자르기 시도
+            chunk_end = end
+            # 마침표, 줄바꿈 등을 찾아서 자연스러운 경계 찾기
+            for i in range(end, max(start + chunk_size // 2, end - 200), -1):
+                if text[i] in '.!?\n':
+                    chunk_end = i + 1
+                    break
+            chunks.append(text[start:chunk_end])
+            start = chunk_end - overlap  # overlap만큼 뒤로
+        else:
+            chunks.append(text[start:])
+            break
+    
+    logger.info(f"Split into {len(chunks)} chunks with overlap={overlap}")
+    return chunks
+
+def summarize_chunk_with_overlap(
+    chunk_key: str, 
+    chunk_content: str, 
+    paper_title: str,
+    use_overlap: bool = True,
+    prev_summary: str = ""
+) -> str:
+    """
+    청크를 overlap을 가지고 요약 (섹션 이름 무관)
+    - chunk_key: "section_01_abstract" 또는 "chunk_00" 형식
+    - prev_summary: 이전 청크의 요약 (context로 사용)
+    """
+    if not chunk_content.strip():
         return ""
-    prompts = {
-        "abstract": "Abstract 핵심을 간결하게 요약.",
-        "introduction": "Introduction의 배경/문제/목표를 요약.",
-        "methods": "Methods의 핵심 알고리즘/모델/데이터/학습설정 요약.",
-        "results": "Results의 주요 실험설정/지표/비교결과 요약.",
-        "discussion": "Discussion의 인사이트/의미/한계 요약.",
-        "conclusion": "Conclusion의 결론/기여/향후과제 요약.",
-        "other": "다음 내용을 핵심 위주로 요약.",
-    }
-    prompt = prompts.get(section_name, prompts["other"])
+    
+    # 청크 타입에 따라 프롬프트 조정
+    if chunk_key.startswith("section_"):
+        # 섹션 기반: 헤더 이름 추출
+        header_part = chunk_key.split("_", 2)[-1] if "_" in chunk_key else "content"
+        prompt = f"다음 '{header_part}' 섹션의 핵심 내용을 요약하세요."
+    else:
+        # 토큰 기반: 순서만 표시
+        chunk_num = chunk_key.split("_")[-1] if "_" in chunk_key else "0"
+        prompt = f"논문의 일부분 (Part {chunk_num})을 요약하세요."
+    
     budget_tokens = min(LLM_MAX_TOKENS - 800, 3000)
-    approx = _estimate_tokens(section_content)
-    chunks = [section_content]
-    if approx > budget_tokens:
-        n = math.ceil(approx / budget_tokens)
-        step = math.ceil(len(section_content) / n)
-        chunks = [section_content[i:i+step] for i in range(0, len(section_content), step)]
-
-    summaries = []
-    for ch in chunks:
+    approx_tokens = _estimate_tokens(chunk_content)
+    
+    # 청크가 너무 크면 다시 분할
+    if approx_tokens <= budget_tokens:
+        # 한 번에 처리 가능
+        context_prompt = ""
+        if prev_summary and use_overlap:
+            context_prompt = f"\n이전 내용 요약: {prev_summary}\n"
+        
         msgs = [
             {"role": "system", "content": "You are an expert AI paper analyst. Keep technical terms in English."},
-            {"role": "user", "content": f"[{paper_title}] {prompt}\n\nContent:\n{ch}"},
+            {"role": "user", "content": f"[{paper_title}] {prompt}{context_prompt}\n\n내용:\n{chunk_content}"},
         ]
-        summaries.append(call_llm(msgs, max_tokens=min(1500, LLM_MAX_TOKENS - 500)))
-
+        return call_llm(msgs, max_tokens=min(1500, LLM_MAX_TOKENS - 500))
+    
+    # 너무 크면 sub-chunk로 분할
+    chunk_size_chars = budget_tokens * 4
+    overlap_chars = 400 if use_overlap else 0
+    
+    sub_chunks = smart_chunk_with_overlap(chunk_content, chunk_size_chars, overlap_chars)
+    
+    summaries = []
+    sub_prev_summary = prev_summary
+    
+    for i, sub_chunk in enumerate(sub_chunks):
+        context_prompt = ""
+        if sub_prev_summary and use_overlap:
+            context_prompt = f"\n이전 내용: {sub_prev_summary}\n"
+        
+        msgs = [
+            {"role": "system", "content": "You are an expert AI paper analyst. Keep technical terms in English."},
+            {"role": "user", "content": f"[{paper_title}] {prompt} (sub-part {i+1}/{len(sub_chunks)}){context_prompt}\n\n{sub_chunk}"},
+        ]
+        summary = call_llm(msgs, max_tokens=min(1500, LLM_MAX_TOKENS - 500))
+        summaries.append(summary)
+        sub_prev_summary = summary
+    
+    # 여러 sub-chunk 요약을 병합
     if len(summaries) == 1:
         return summaries[0]
+    
     merge_msgs = [
         {"role": "system", "content": "You are an expert AI paper analyst."},
-        {"role": "user", "content": "Merge the partial summaries into one concise section summary:\n\n" + "\n\n".join(summaries)},
+        {"role": "user", "content": f"다음은 [{paper_title}]의 '{chunk_key}' 부분을 여러 sub-part로 나눠 요약한 결과입니다. 이를 하나의 일관된 요약으로 병합하세요:\n\n" + "\n\n---\n\n".join(summaries)},
     ]
     return call_llm(merge_msgs, max_tokens=1200)
 
+def create_hierarchical_summary_v2(chunk_summaries: Dict[str, str], paper_title: str) -> Dict[str, str]:
+    """
+    계층적 요약 생성 v2 (위치 기반)
+    Level 1: 청크 요약 (이미 완료)
+    Level 2: 위치별 그룹 요약 (beginning, middle, end)
+    Level 3: 최종 통합 요약
+    
+    섹션 이름에 의존하지 않고 논문의 위치(앞/중간/뒤)로 그룹핑
+    """
+    logger.info("Creating hierarchical summary (position-based)...")
+    
+    num_chunks = len(chunk_summaries)
+    if num_chunks == 0:
+        return {}
+    
+    # Level 2: 위치 기반 그룹핑
+    items = list(chunk_summaries.items())
+    
+    if num_chunks <= 2:
+        # 청크가 너무 적으면 그대로 사용
+        groups = {"full": items}
+    elif num_chunks <= 5:
+        # 청크가 적으면 2개 그룹
+        mid_point = num_chunks // 2
+        groups = {
+            "beginning": items[:mid_point],
+            "end": items[mid_point:]
+        }
+    else:
+        # 청크가 많으면 3개 그룹
+        third = num_chunks // 3
+        groups = {
+            "beginning": items[:third],
+            "middle": items[third:third*2],
+            "end": items[third*2:]
+        }
+    
+    # 그룹별 프롬프트
+    group_prompts = {
+        "full": "논문의 전체 내용을 종합적으로 요약하세요.",
+        "beginning": "논문의 도입부 (배경, 문제 정의, 목표, 관련 연구)를 종합적으로 요약하세요.",
+        "middle": "논문의 핵심 부분 (방법론, 실험 설계, 결과, 성능)을 종합적으로 요약하세요.",
+        "end": "논문의 결론 부분 (인사이트, 한계, 기여, 향후 과제)을 종합적으로 요약하세요."
+    }
+    
+    intermediate_summaries = {}
+    for group_name, group_items in groups.items():
+        if not group_items:
+            continue
+        
+        # 그룹 내 요약들을 결합
+        group_texts = [f"### Part {i+1}\n{summary}" for i, (key, summary) in enumerate(group_items)]
+        combined = "\n\n".join(group_texts)
+        
+        prompt = group_prompts.get(group_name, "다음 내용을 종합적으로 요약하세요.")
+        
+        msgs = [
+            {"role": "system", "content": "You are an expert AI paper analyst."},
+            {"role": "user", "content": f"[{paper_title}] {prompt}\n\n{combined}"},
+        ]
+        
+        intermediate_summaries[group_name] = call_llm(msgs, max_tokens=1000)
+        logger.info(f"Created intermediate summary for '{group_name}' ({len(group_items)} chunks)")
+    
+    return intermediate_summaries
+
 def _json_extract(s: str) -> Optional[Dict]:
+    """문자열에서 JSON 추출"""
     m = re.search(r"\{[\s\S]*\}", s)
     if not m:
         return None
@@ -357,17 +594,62 @@ def _json_extract(s: str) -> Optional[Dict]:
     except Exception:
         return None
 
-def analyze_paper_with_llm(paper_info: Dict, markdown_content: str, json_metadata: Dict) -> PaperAnalysis:
-    logger.info(f"Analyzing paper with LLM: {paper_info.get('title','Unknown')}")
-    sections = extract_sections_from_markdown(markdown_content)
-    section_summaries: Dict[str, str] = {}
-    for sec, content in sections.items():
-        if content.strip():
-            section_summaries[sec] = summarize_section(sec, content, paper_info.get("title","Unknown"))
-
-    combined = "\n\n".join([f"## {k.title()}\n{v}" for k, v in section_summaries.items() if v.strip()])
+def analyze_paper_with_llm_improved(
+    paper_info: Dict, 
+    markdown_content: str, 
+    json_metadata: Dict,
+    use_hierarchical: bool = True,
+    use_overlap: bool = True,
+    return_intermediate: bool = False
+) -> Tuple[PaperAnalysis, Optional[Dict]]:
+    """
+    개선된 논문 분석 함수 v2 (하이브리드 청킹)
+    - 헤더 많으면 → 섹션 기반
+    - 헤더 적으면 → 토큰 기반
+    - use_hierarchical: 계층적 요약 사용
+    - use_overlap: overlap chunking 사용
+    - return_intermediate: 중간 단계 결과 반환
+    """
+    logger.info(f"Analyzing paper (hierarchical={use_hierarchical}, overlap={use_overlap}): {paper_info.get('title','Unknown')}")
+    
+    # Step 1: 스마트 청킹 (하이브리드)
+    chunks, chunking_method = smart_chunk_hybrid(markdown_content, min_headers=8)
+    logger.info(f"Chunking method: {chunking_method}, total chunks: {len(chunks)}")
+    
+    # Step 2: 각 청크 요약
+    chunk_summaries: Dict[str, str] = {}
+    prev_summary = ""
+    
+    for chunk_key, content in chunks.items():
+        if content.strip() and len(content.strip()) > 100:  # 100자 이상만
+            summary = summarize_chunk_with_overlap(
+                chunk_key, 
+                content, 
+                paper_info.get("title", "Unknown"),
+                use_overlap=use_overlap,
+                prev_summary=prev_summary if use_overlap else ""
+            )
+            chunk_summaries[chunk_key] = summary
+            prev_summary = summary
+    
+    logger.info(f"Created {len(chunk_summaries)} chunk summaries")
+    
+    # Step 3: 계층적 요약 (옵션)
+    intermediate_summaries = {}
+    if use_hierarchical and len(chunk_summaries) > 0:
+        intermediate_summaries = create_hierarchical_summary_v2(
+            chunk_summaries, 
+            paper_info.get("title", "Unknown")
+        )
+        # 계층적 요약을 사용하여 최종 분석
+        combined = "\n\n".join([f"## {k.title()}\n{v}" for k, v in intermediate_summaries.items() if v.strip()])
+    else:
+        # 기존 방식: 청크 요약을 직접 결합
+        combined = "\n\n".join([f"## {k}\n{v}" for k, v in chunk_summaries.items() if v.strip()])
+    
+    # Step 4: 최종 종합 분석
     format_hint = {
-        "title": paper_info.get("title","Unknown"),
+        "title": paper_info.get("title", "Unknown"),
         "tldr": "",
         "key_contributions": [],
         "methodology": "",
@@ -377,11 +659,12 @@ def analyze_paper_with_llm(paper_info: Dict, markdown_content: str, json_metadat
         "relevance_score": 7,
         "tags": [],
     }
-    final_prompt = f"""논문 "{paper_info.get('title','Unknown')}"의 섹션별 요약이 아래에 있습니다:
+    
+    final_prompt = f"""논문 "{paper_info.get('title','Unknown')}"의 {'계층적 ' if use_hierarchical else ''}요약이 아래에 있습니다:
 
 {combined}
 
-아래 JSON 스키마에 맞게 결과만 JSON으로 출력하세요(설명문 금지):
+아래 JSON 스키마에 맞게 결과만 JSON으로 한글로 출력하세요(설명문 금지):
 {json.dumps(format_hint, ensure_ascii=False, indent=2)}
 
 규칙:
@@ -390,27 +673,57 @@ def analyze_paper_with_llm(paper_info: Dict, markdown_content: str, json_metadat
 - tags: 5~8개 짧은 표제어 (영문)
 - 전문 용어는 English 그대로 유지
 """
+    
     msgs = [
         {"role": "system", "content": "You are an expert AI/ML researcher. Return ONLY valid JSON."},
         {"role": "user", "content": final_prompt},
     ]
     final_out = call_llm(msgs, max_tokens=min(2500, LLM_MAX_TOKENS))
     parsed = _json_extract(final_out) or {}
-
-    return PaperAnalysis(
-        title=paper_info.get("title","Unknown"),
+    
+    # Abstract 추출 (첫 번째 청크에서)
+    abstract_text = ""
+    for key, content in chunks.items():
+        if len(content) < 2000:  # abstract는 보통 짧음
+            abstract_text = content[:800]
+            break
+    
+    analysis = PaperAnalysis(
+        title=paper_info.get("title", "Unknown"),
         authors=paper_info.get("authors", []),
-        abstract=(sections.get("abstract","")[:800] if sections.get("abstract") else ""),
+        abstract=abstract_text if abstract_text else "",
         summary=final_out if isinstance(final_out, str) else json.dumps(final_out, ensure_ascii=False),
         key_contributions=parsed.get("key_contributions", []),
-        methodology=parsed.get("methodology", section_summaries.get("methods","")),
-        results=parsed.get("results", section_summaries.get("results","")),
+        methodology=parsed.get("methodology", ""),
+        results=parsed.get("results", ""),
         relevance_score=int(parsed.get("relevance_score", 7)),
         tags=parsed.get("tags", []),
-        source_file=paper_info.get("s3_key",""),
+        source_file=paper_info.get("s3_key", ""),
     )
+    
+    # 중간 단계 결과
+    intermediate_data = None
+    if return_intermediate:
+        intermediate_data = {
+            "chunking_method": chunking_method,
+            "num_chunks": len(chunks),
+            "chunks_detected": list(chunks.keys()),
+            "chunk_summaries": chunk_summaries,
+            "intermediate_summaries": intermediate_summaries if use_hierarchical else {},
+        }
+    
+    return analysis, intermediate_data
 
-# ===== Confluence (optional) =====
+# 기존 함수 호환성 유지
+def analyze_paper_with_llm(paper_info: Dict, markdown_content: str, json_metadata: Dict) -> PaperAnalysis:
+    """기존 함수 (개선 버전 호출)"""
+    analysis, _ = analyze_paper_with_llm_improved(
+        paper_info, markdown_content, json_metadata,
+        use_hierarchical=True, use_overlap=True, return_intermediate=False
+    )
+    return analysis
+
+# ===== Confluence =====
 def _conf_get_page_by_title(title: str) -> Optional[Dict]:
     url = f"{CONFLUENCE_URL}/rest/api/content"
     params = {"title": title, "spaceKey": CONFLUENCE_SPACE_KEY, "expand": "version"}
@@ -523,18 +836,24 @@ def build_markdown(analyses: List[PaperAnalysis], week_label: str, prefix: str) 
     md_filename = f"{week_label}.md"
     return md_filename, md_content
 
-# ===== Routes =====
+# ===== Main Routes =====
 @app.get("/")
 async def root():
     return {
         "service": "AI Paper Newsletter Processor",
+        "version": "2.0.0",
         "status": "running",
-        "available_endpoints": ["/health", "/list-s3-papers", "/process-s3-papers"],
+        "improvements": [
+            "smart_hybrid_chunking (header-based or token-based)",
+            "overlap_chunking",
+            "hierarchical_summarization (position-based)"
+        ],
+        "available_endpoints": ["/health", "/list-s3-papers", "/process-s3-papers", "/debug/*"],
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "mode": "S3-only (internal)"}
+    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "mode": "S3-only (v2: hybrid chunking)"}
 
 @app.get("/list-s3-papers")
 async def list_s3_papers(bucket: Optional[str] = None, prefix: Optional[str] = None):
@@ -557,7 +876,7 @@ async def list_s3_papers(bucket: Optional[str] = None, prefix: Optional[str] = N
 
 @app.post("/process-s3-papers")
 async def process_s3_papers(request: S3PapersRequest):
-    logger.info("Processing S3 papers")
+    logger.info(f"Processing S3 papers (hierarchical={request.use_hierarchical}, overlap={request.use_overlap})")
     bucket = request.bucket or S3_BUCKET
     prefix = request.prefix or S3_PAPERS_PREFIX
     try:
@@ -584,7 +903,12 @@ async def process_s3_papers(request: S3PapersRequest):
                 tmp = download_pdf_from_s3(p["s3_key"], p["s3_bucket"])
                 md, meta = parse_pdf_with_docpamin(tmp)
                 info = {"title": p["title"], "authors": [], "abstract": "", "s3_key": p["s3_key"]}
-                a = analyze_paper_with_llm(info, md, meta)
+                a, _ = analyze_paper_with_llm_improved(
+                    info, md, meta,
+                    use_hierarchical=request.use_hierarchical,
+                    use_overlap=request.use_overlap,
+                    return_intermediate=False
+                )
                 a.source_file = p["s3_key"]
                 return a, None
             except Exception as e:
@@ -622,6 +946,10 @@ async def process_s3_papers(request: S3PapersRequest):
             "md_filename": md_filename,
             "md_content": md_content,
             "confluence_url": (confluence_result or {}).get("page_url"),
+            "improvements_used": {
+                "hierarchical": request.use_hierarchical,
+                "overlap": request.use_overlap
+            }
         }
     except Exception as e:
         logger.exception("process_s3_papers error")
@@ -667,18 +995,15 @@ async def batch_process_papers(request: BatchProcessRequest):
         logger.exception("batch_process error")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==== [1] 로컬 파일 업로드 → 파싱 테스트 ====
+# ===== Debug Endpoints =====
+
 @app.post("/debug/parse-file")
 async def debug_parse_file(
     file: UploadFile = File(...),
     include_markdown: bool = Form(False),
     markdown_max_chars: int = Form(5000),
 ):
-    """
-    로컬에서 PDF만 업로드해서 Docpamin 파싱을 테스트할 수 있는 디버그 엔드포인트.
-    multipart/form-data로 파일 업로드.
-    """
-    # 임시 저장
+    """로컬 PDF 파일 업로드 → Docpamin 파싱 테스트"""
     suffix = Path(file.filename).suffix or ".pdf"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
@@ -703,16 +1028,12 @@ async def debug_parse_file(
         except Exception:
             pass
 
-# ==== [2] S3 단일 객체 key → 파싱 테스트 ====
 @app.post("/debug/parse-s3")
 async def debug_parse_s3(req: DebugParseS3Request):
-    """
-    S3의 특정 key만 Docpamin 파싱 테스트.
-    """
+    """S3 특정 key → Docpamin 파싱 테스트"""
     bucket = req.bucket or S3_BUCKET
     if not bucket:
-        raise HTTPException(status_code=400, detail="Bucket is required (env S3_BUCKET_NAME or request.bucket)")
-    # 다운로드 후 파싱
+        raise HTTPException(status_code=400, detail="Bucket is required")
     tmp = None
     try:
         tmp = download_pdf_from_s3(s3_key=req.key, s3_bucket=bucket)
@@ -734,35 +1055,43 @@ async def debug_parse_s3(req: DebugParseS3Request):
         except Exception:
             pass
 
-# ==== [3] Markdown 텍스트 → 섹션/최종 요약 테스트 ====
 @app.post("/debug/summarize-markdown")
 async def debug_summarize_markdown(req: DebugSummarizeMarkdownRequest):
     """
-    임의의 markdown 문자열을 입력받아:
-      - 섹션 분해 (abstract/introduction/methods/results/...)
-      - 섹션별 요약 (옵션)
-      - 최종 종합 분석(LLM) (옵션)
-    을 수행.
+    Markdown 텍스트 → 청크/최종 요약 테스트 (개선 버전 v2)
+    - use_hierarchical: 계층적 요약 사용
+    - use_overlap: overlap chunking 사용
+    - show_intermediate_steps: 중간 단계 출력
     """
     if not req.markdown or not req.markdown.strip():
         raise HTTPException(status_code=400, detail="markdown is empty")
 
-    sections = extract_sections_from_markdown(req.markdown)
-
-    section_summaries = {}
+    # 스마트 청킹 (하이브리드)
+    chunks, chunking_method = smart_chunk_hybrid(req.markdown, min_headers=8)
+    
+    chunk_summaries = {}
     if req.include_section_summaries:
-        for sec_name, sec_text in sections.items():
-            if not sec_text.strip():
+        prev_summary = ""
+        for chunk_key, chunk_text in chunks.items():
+            if not chunk_text.strip() or len(chunk_text.strip()) < 100:
                 continue
-            section_summaries[sec_name] = summarize_section(sec_name, sec_text, req.title)
+            chunk_summaries[chunk_key] = summarize_chunk_with_overlap(
+                chunk_key, chunk_text, req.title, 
+                use_overlap=req.use_overlap,
+                prev_summary=prev_summary if req.use_overlap else ""
+            )
+            prev_summary = chunk_summaries[chunk_key]
 
     final_analysis = None
+    intermediate_data = None
     if req.include_final_analysis:
-        # analyze_paper_with_llm는 내부에서 섹션 요약을 다시 수행하지만,
-        # 이미 섹션 요약이 있다면 더 빠르게 하려면 별도 경로를 만들어도 됨.
         paper_info = {"title": req.title, "authors": [], "abstract": "", "s3_key": ""}
-        final = analyze_paper_with_llm(paper_info, req.markdown, {})
-        # Pydantic 모델 → dict
+        final, intermediate = analyze_paper_with_llm_improved(
+            paper_info, req.markdown, {},
+            use_hierarchical=req.use_hierarchical,
+            use_overlap=req.use_overlap,
+            return_intermediate=req.show_intermediate_steps
+        )
         final_analysis = {
             "title": final.title,
             "authors": final.authors,
@@ -774,37 +1103,50 @@ async def debug_summarize_markdown(req: DebugSummarizeMarkdownRequest):
             "relevance_score": final.relevance_score,
             "tags": final.tags,
         }
+        intermediate_data = intermediate
 
     return {
         "title": req.title,
-        "sections_detected": [k for k, v in sections.items() if v.strip()],
-        "section_summaries": section_summaries if req.include_section_summaries else {},
+        "chunking_method": chunking_method,
+        "chunks_detected": list(chunks.keys()),
+        "chunk_summaries": chunk_summaries if req.include_section_summaries else {},
         "final_analysis": final_analysis,
+        "intermediate_steps": intermediate_data if req.show_intermediate_steps else None,
         "markdown_preview": _preview(req.markdown, req.return_markdown_preview_chars),
+        "improvements_used": {
+            "hierarchical": req.use_hierarchical,
+            "overlap": req.use_overlap
+        }
     }
 
-# ==== [4] 섹션 dict → 섹션 요약만 테스트 ====
 @app.post("/debug/summarize-sections")
 async def debug_summarize_sections(req: DebugSummarizeSectionsRequest):
-    """
-    섹션 dict(예: {'abstract': '...', 'results': '...'})을 넣어서
-    섹션 요약만 빠르게 테스트.
-    """
+    """섹션/청크 dict → 요약 테스트 (개선 버전)"""
     if not req.sections:
         raise HTTPException(status_code=400, detail="sections is empty")
 
     targets = req.only_sections or list(req.sections.keys())
     out: Dict[str, str] = {}
+    prev_summary = ""
+    
     for sec in targets:
         text = req.sections.get(sec, "")
         if not text.strip():
             continue
-        out[sec] = summarize_section(sec, text, req.title)
+        out[sec] = summarize_chunk_with_overlap(
+            sec, text, req.title, 
+            use_overlap=req.use_overlap,
+            prev_summary=prev_summary if req.use_overlap else ""
+        )
+        prev_summary = out[sec]
 
     return {
         "title": req.title,
         "summarized_sections": list(out.keys()),
         "summaries": out,
+        "improvements_used": {
+            "overlap": req.use_overlap
+        }
     }
 
 if __name__ == "__main__":
