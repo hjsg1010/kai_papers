@@ -1182,6 +1182,10 @@ async def debug_parse_file(
             "md_len": len(md),
             "md_preview": _preview(md, markdown_max_chars),
             "metadata": meta,
+            "images_info": meta.get("images_info"),
+            # 🔄  Backwards compatibility: older scripts expect `json_metadata`
+            #     while newer ones read `metadata`.
+            "json_metadata": meta,
         }
         if include_markdown:
             resp["markdown"] = md
@@ -1209,6 +1213,9 @@ async def debug_parse_s3(req: DebugParseS3Request):
             "md_len": len(md),
             "md_preview": _preview(md, req.markdown_max_chars),
             "metadata": meta,
+            "images_info": meta.get("images_info"),
+            # 🔄  Maintain both keys so workflows consuming either continue working.
+            "json_metadata": meta,
         }
         if req.include_markdown:
             resp["markdown"] = md
@@ -1317,3 +1324,5 @@ async def debug_summarize_sections(req: DebugSummarizeSectionsRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("paper_processor:app", host="0.0.0.0", port=7070, reload=False, workers=2)
+
+    
