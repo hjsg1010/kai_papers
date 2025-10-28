@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""
-AI Paper Newsletter Processor (S3-only, Markdown + Git-ready)
-- S3에서 PDF 수집
-- Docpamin(API)로 파싱 → LLM으로 섹션/전체 요약
-- Markdown 문서 생성 (wNN.md)
-- (옵션) Confluence 업로드
-- n8n에서 md를 받아 Git에 업로드 가능
-
-[개선사항 v2 - 하이브리드 청킹]
-- Smart Hybrid Chunking: 헤더 개수에 따라 자동 선택
-  - 헤더 5개 이상 → 섹션 기반 (모든 헤더 추출)
-  - 헤더 5개 미만 → 토큰 기반 (균등 분할)
-- Overlap chunking으로 맥락 보존
-- Hierarchical summarization (위치 기반: beginning/middle/end)
-- Sliding window with context
-"""
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from pydantic import BaseModel, Field
@@ -36,12 +20,55 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import textwrap
-from dotenv import load_dotenv
+import base64
+import hashlib
+from dotenv import load_dotenv, dotenv_values
 
-load_dotenv()
+load_dotenv(override=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ===== Image Preprocessing Functions =====
+
+def remove_base64_images(markdown: str, replacement: str = "[Image]") -> Tuple[str, int]:
+    """
+    Base64 이미지를 플레이스홀더로 대체
+    
+    Returns:
+        (cleaned_markdown, num_removed)
+    """
+    pattern = r'!\[([^\]]*)\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=]+\)'
+    cleaned, count = re.subn(pattern, replacement, markdown)
+    if count > 0:
+        logger.info(f"Removed {count} base64 images from markdown")
+    return cleaned, count
+
+def extract_base64_images(markdown: str) -> List[Dict]:
+    """Markdown에서 base64 이미지 추출"""
+    pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([A-Za-z0-9+/=]+)\)'
+    images = []
+    for match in re.finditer(pattern, markdown):
+        base64_data = match.group(3)
+        size_bytes = len(base64_data) * 3 // 4
+        images.append({
+            'full_match': match.group(0),
+            'alt_text': match.group(1),
+            'mime_type': match.group(2),
+            'base64_data': base64_data,
+            'size_kb': size_bytes / 1024,
+            'position': match.start()
+        })
+    return images
+
+def select_representative_image(images: List[Dict], min_kb: float = 10, max_kb: float = 200) -> Optional[Dict]:
+    """대표 이미지 선정 (크기 + 위치 기준)"""
+    if not images:
+        return None
+    candidates = [img for img in images if min_kb <= img['size_kb'] <= max_kb]
+    if not candidates:
+        candidates = sorted(images, key=lambda x: abs(x['size_kb'] - (min_kb + max_kb) / 2))[:3]
+    return min(candidates, key=lambda x: x['position']) if candidates else None
 
 app = FastAPI(
     title="AI Paper Newsletter Processor",
@@ -63,16 +90,12 @@ DOCPAMIN_API_KEY = os.getenv("DOCPAMIN_API_KEY")
 DOCPAMIN_BASE_URL = os.getenv("DOCPAMIN_BASE_URL", "https://docpamin.superaip.samsungds.net/api/v1")
 DOCPAMIN_CRT_FILE = os.getenv("DOCPAMIN_CRT_FILE", "/etc/ssl/certs/ca-certificates.crt")
 
-# LLM_API_KEY = os.getenv("LLM_API_KEY")
-# LLM_BASE_URL = os.getenv("LLM_BASE_URL")
-# LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
-# LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "10000"))
+print(f"crt : {DOCPAMIN_CRT_FILE}")
 
-LLM_API_KEY="sk-1234"
-LLM_BASE_URL="http://10.166.249.91:4000/v1"
-LLM_MODEL="openai/gpt-oss-120b"
-LLM_MAX_TOKENS=10000
-# print(f"=================\n\n{LLM_API_KEY}\n{LLM_BASE_URL}\n{LLM_MODEL}\n\n\n\n\n==================================")
+LLM_API_KEY = os.getenv("LLM_API_KEY")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "30000"))
 
 CONFLUENCE_URL = os.getenv("CONFLUENCE_URL")
 CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL")
@@ -221,11 +244,8 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
             data = {
                 "alarm_options": json.dumps({"enabled": False}),
                 "workflow_options": json.dumps({
-                    "workflow": "docling",
-                    "worker_options": {
-                        "docling_to_formats": ["md", "json"],
-                        "docling_image_export_mode": "embedded",
-                    },
+                    "workflow": "dp-o1",
+                    "image_export_mode": "embedded"
                 }),
             }
             r = session.post(f"{DOCPAMIN_BASE_URL}/tasks", files=files, data=data,
@@ -273,10 +293,116 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
         if not md:
             raise Exception("Docpamin: no markdown in export")
         logger.info(f"Docpamin parsed OK (md_len={len(md)})")
-        return md, meta
+        
+        # ⭐ 이미지 전처리: base64 제거, 대표 이미지 추출
+        md_cleaned, extracted_images = process_markdown_images(
+            md, 
+            remove_for_llm=True,  # LLM 입력용으로 base64 제거
+            keep_representative=1
+        )
+        
+        # 메타데이터에 이미지 정보 추가
+        if extracted_images:
+            meta['images_info'] = {
+                'total_images': len(extracted_images),
+                'representative_images': select_representative_images(extracted_images, max_count=1)
+            }
+            logger.info(f"Image preprocessing: {len(extracted_images)} images, "
+                       f"markdown size reduced from {len(md)} to {len(md_cleaned)} chars")
+        
+        return md_cleaned, meta
     except Exception as e:
         logger.error(f"Docpamin error: {e}")
         raise
+
+# ===== Image Processing =====
+def process_markdown_images(
+    markdown: str, 
+    remove_for_llm: bool = True,
+    keep_representative: int = 1
+) -> Tuple[str, List[Dict]]:
+    """
+    Markdown에서 이미지 처리
+    
+    Args:
+        markdown: 원본 markdown (base64 이미지 포함)
+        remove_for_llm: LLM 요약용으로 이미지 제거 여부
+        keep_representative: 최종 결과물에 포함할 대표 이미지 개수
+    
+    Returns:
+        (processed_markdown, extracted_images)
+    """
+    # Base64 이미지 패턴: ![alt](data:image/png;base64,...)
+    pattern = r'!\[(.*?)\]\(data:image/([^;]+);base64,([A-Za-z0-9+/=]+)\)'
+    
+    images = []
+    
+    def extract_image(match):
+        alt_text = match.group(1)
+        img_type = match.group(2)
+        base64_data = match.group(3)
+        
+        full_img = match.group(0)
+        img_size = len(base64_data)
+                
+        images.append({
+            'index': len(images),
+            'alt': alt_text.strip(),
+            'type': img_type,
+            'size': img_size,
+            'size_kb': img_size * 3 / 4 / 1024,  # ⭐ 추가!
+            'base64_data': base64_data,          # ⭐ 추가!
+            'full': full_img
+        })
+        
+        if remove_for_llm:
+            # LLM용: 이미지를 캡션 플레이스홀더로 대체
+            if alt_text.strip():
+                return f"\n[Figure {len(images)}: {alt_text}]\n"
+            else:
+                return f"\n[Figure {len(images)}]\n"
+        else:
+            # 원본 유지
+            return full_img
+    
+    # 이미지 추출 및 처리
+    processed_md = re.sub(pattern, extract_image, markdown)
+    
+    if images:
+        total_img_size = sum(img['size'] for img in images)
+        logger.info(f"Processed {len(images)} images. "
+                   f"Total image data: {total_img_size:,} chars")
+        logger.info(f"Size reduction: {len(markdown) - len(processed_md):,} chars "
+                   f"({100 * (1 - len(processed_md) / len(markdown)):.1f}%)")
+    
+    return processed_md, images
+
+def select_representative_images(images: List[Dict], max_count: int = 1) -> List[Dict]:
+    """
+    대표 이미지 선택 (크기 기준 - 큰 이미지 = 주요 figure)
+    
+    Args:
+        images: 추출된 이미지 리스트
+        max_count: 선택할 최대 이미지 개수
+    
+    Returns:
+        선택된 대표 이미지 리스트
+    """
+    if not images:
+        return []
+    
+    # 크기 순 정렬 (큰 이미지가 보통 더 중요)
+    sorted_imgs = sorted(images, key=lambda x: x['size'], reverse=True)
+    
+    representatives = sorted_imgs[:max_count]
+    
+    indices = [img['index'] for img in representatives]
+    sizes = [format(img['size'], ',') for img in representatives]
+    
+    logger.info(f"Selected {len(representatives)} representative image(s): "
+               f"indices {indices}, sizes {sizes}")
+    
+    return representatives
 
 # ===== LLM utils =====
 def _estimate_tokens(s: str) -> int:
@@ -287,28 +413,36 @@ def call_llm(messages: List[Dict], max_tokens: int = 2000) -> str:
     """LLM API 호출"""
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": LLM_MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2}
-    # print(f"==================================\n {payload}")
     try:
-        base_url = LLM_BASE_URL.rstrip('/')
-        r = requests.post(f"http://10.166.249.91:4000/v1/chat/completions", headers=headers, json=payload, timeout=120)
+        # trailing slash 제거하여 이중 슬래시 방지
+        base_url = LLM_BASE_URL.rstrip('/') if LLM_BASE_URL else ""
+        url = f"{base_url}/chat/completions"
+        
+        logger.info(f"Calling LLM: {url} (model: {LLM_MODEL})")
+        
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
         r.raise_for_status()
         j = r.json()
         return j["choices"][0]["message"]["content"]
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"LLM API HTTP Error: {e.response.status_code} - {e.response.text[:200]}")
+        raise
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         raise
 
 def extract_all_headers(markdown_content: str) -> Dict[str, str]:
     """
-    섹션 이름에 관계없이 모든 헤더를 추출하여 섹션으로 분리
+    섹션 이름에 관계없이 주요 헤더만 추출하여 섹션으로 분리
+    # (Level 1) 과 ## (Level 2) 헤더만 사용 (### 제외)
     """
-    logger.info("Extracting all headers from markdown...")
+    logger.info("Extracting main headers (# and ##) from markdown...")
     sections = []
     current_section = {"header": "preamble", "level": 0, "content": []}
     
     for line in markdown_content.splitlines():
-        # 헤더 감지 (# ~ ###)
-        header_match = re.match(r'^(#{1,3})\s+(.+)$', line.strip())
+        # 헤더 감지 (# 또는 ## 만, ### 제외!)
+        header_match = re.match(r'^(#{1,2})\s+(.+)$', line.strip())
         
         if header_match:
             # 이전 섹션 저장
@@ -385,29 +519,32 @@ def chunk_by_tokens(text: str, chunk_size: int = 4000, overlap: int = 400) -> Li
     logger.info(f"Created {len(chunks)} chunks by tokens")
     return chunks
 
-def smart_chunk_hybrid(markdown_content: str, min_headers: int = 8) -> Tuple[Dict[str, str], str]:
+def smart_chunk_hybrid(markdown_content: str, min_headers: int = 10) -> Tuple[Dict[str, str], str]:
     """
     하이브리드 청킹: 헤더 개수에 따라 방식 선택
+    
+    기본값을 8→10으로 상향 조정하여 청크 수 더욱 감소
+    # (Level 1) 헤더만 카운트 (## 제외)
     
     Returns:
         (chunks_dict, method_used)
         method_used: "header_based" or "token_based"
     """
-    # 헤더 개수 확인
-    headers = re.findall(r'^#{1,3}\s+.+$', markdown_content, re.MULTILINE)
-    num_headers = len(headers)
+    # 메인 헤더만 카운트 (# 만, ## 제외)
+    main_headers = re.findall(r'^#\s+[^#].+$', markdown_content, re.MULTILINE)
+    num_headers = len(main_headers)
     
-    logger.info(f"Found {num_headers} headers in markdown")
+    logger.info(f"Found {num_headers} main headers (# only) in markdown")
     
     if num_headers >= min_headers:
-        # 충분한 헤더 → 헤더 기반 섹션 분리
+        # 충분한 헤더 → 헤더 기반 섹션 분리 (하지만 거의 없을 것)
         logger.info(f"Using HEADER-BASED chunking ({num_headers} headers >= {min_headers})")
         chunks = extract_all_headers(markdown_content)
         return chunks, "header_based"
     else:
-        # 헤더 부족 → 토큰 기반 균등 분할
+        # 헤더 부족 → 토큰 기반 균등 분할 (대부분 이쪽)
         logger.info(f"Using TOKEN-BASED chunking ({num_headers} headers < {min_headers})")
-        chunk_list = chunk_by_tokens(markdown_content, chunk_size=4000, overlap=400)
+        chunk_list = chunk_by_tokens(markdown_content, chunk_size=6000, overlap=600)
         chunks = {f"chunk_{i:02d}": chunk for i, chunk in enumerate(chunk_list)}
         return chunks, "token_based"
 
@@ -612,8 +749,18 @@ def analyze_paper_with_llm_improved(
     """
     logger.info(f"Analyzing paper (hierarchical={use_hierarchical}, overlap={use_overlap}): {paper_info.get('title','Unknown')}")
     
-    # Step 1: 스마트 청킹 (하이브리드)
-    chunks, chunking_method = smart_chunk_hybrid(markdown_content, min_headers=8)
+    # Step 0: 이미지 처리 (LLM 토큰 절약)
+    clean_markdown, extracted_images = process_markdown_images(
+        markdown_content, 
+        remove_for_llm=True,
+        keep_representative=1
+    )
+    
+    if extracted_images:
+        logger.info(f"Removed {len(extracted_images)} images for LLM processing")
+    
+    # Step 1: 스마트 청킹 (하이브리드) - clean_markdown 사용
+    chunks, chunking_method = smart_chunk_hybrid(clean_markdown, min_headers=10)
     logger.info(f"Chunking method: {chunking_method}, total chunks: {len(chunks)}")
     
     # Step 2: 각 청크 요약
@@ -664,13 +811,14 @@ def analyze_paper_with_llm_improved(
 
 {combined}
 
-아래 JSON 스키마에 맞게 결과만 JSON으로 한글로 출력하세요(설명문 금지):
+아래 JSON 스키마에 맞게 결과만 JSON으로 출력하세요(설명문 금지):
 {json.dumps(format_hint, ensure_ascii=False, indent=2)}
 
 규칙:
 - key_contributions: 3~6개 bullet 수준의 간결 문장
 - relevance_score: 1~10 정수
 - tags: 5~8개 짧은 표제어 (영문)
+- 한글로 작성
 - 전문 용어는 English 그대로 유지
 """
     
@@ -704,12 +852,29 @@ def analyze_paper_with_llm_improved(
     # 중간 단계 결과
     intermediate_data = None
     if return_intermediate:
+        # 대표 이미지 선택
+        representative_imgs = select_representative_images(extracted_images, max_count=1)
+        
         intermediate_data = {
             "chunking_method": chunking_method,
             "num_chunks": len(chunks),
             "chunks_detected": list(chunks.keys()),
             "chunk_summaries": chunk_summaries,
             "intermediate_summaries": intermediate_summaries if use_hierarchical else {},
+            "images": {
+                "total_count": len(extracted_images),
+                "removed_size": sum(img['size'] for img in extracted_images),
+                "representative": [
+                    {
+                        "index": img['index'],
+                        "alt": img['alt'],
+                        "type": img['type'],
+                        "size": img['size'],
+                        "markdown": img['full']
+                    }
+                    for img in representative_imgs
+                ]
+            }
         }
     
     return analysis, intermediate_data
@@ -1067,7 +1232,7 @@ async def debug_summarize_markdown(req: DebugSummarizeMarkdownRequest):
         raise HTTPException(status_code=400, detail="markdown is empty")
 
     # 스마트 청킹 (하이브리드)
-    chunks, chunking_method = smart_chunk_hybrid(req.markdown, min_headers=8)
+    chunks, chunking_method = smart_chunk_hybrid(req.markdown, min_headers=5)
     
     chunk_summaries = {}
     if req.include_section_summaries:

@@ -5,7 +5,6 @@
 
 BASE_URL="http://localhost:7070"
 MARKDOWN_FILE="paper_markdown.txt"
-# MARKDOWN_FILE="small_test.txt"
 
 echo "=============================================="
 echo "🎯 v2.0 Hybrid Chunking Test"
@@ -45,13 +44,18 @@ echo "----------------------------------------------"
 echo "4️⃣  Chunking Method Detection"
 echo "⏱️  Testing..."
 
+# 임시 파일로 요청 생성 (큰 파일 대응)
+cat > /tmp/chunk_test_request.json << EOF
+{
+  "markdown": $(cat "$MARKDOWN_FILE" | jq -Rs .),
+  "include_section_summaries": false,
+  "include_final_analysis": false
+}
+EOF
+
 RESULT=$(curl -sS -X POST "$BASE_URL/debug/summarize-markdown" \
   -H "Content-Type: application/json" \
-  -d "{
-    \"markdown\": $(echo "$MARKDOWN" | jq -Rs .),
-    \"include_section_summaries\": false,
-    \"include_final_analysis\": false
-  }")
+  -d @/tmp/chunk_test_request.json)
 
 echo "$RESULT" | jq '{
   chunking_method,
@@ -94,15 +98,20 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
   
   START_TIME=$(date +%s)
   
+  # 임시 파일로 요청 생성
+  cat > /tmp/summary_request.json << EOF
+{
+  "markdown": $(cat "$MARKDOWN_FILE" | jq -Rs .),
+  "include_section_summaries": true,
+  "include_final_analysis": false,
+  "use_hierarchical": false,
+  "use_overlap": true
+}
+EOF
+  
   SUMMARY_RESULT=$(curl -sS -X POST "$BASE_URL/debug/summarize-markdown" \
     -H "Content-Type: application/json" \
-    -d "{
-      \"markdown\": $(echo "$MARKDOWN" | jq -Rs .),
-      \"include_section_summaries\": true,
-      \"include_final_analysis\": false,
-      \"use_hierarchical\": false,
-      \"use_overlap\": true
-    }" 2>&1)
+    -d @/tmp/summary_request.json 2>&1)
   
   END_TIME=$(date +%s)
   DURATION=$((END_TIME - START_TIME))
@@ -114,8 +123,14 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "⏱️  Duration: ${DURATION}s"
     echo
     
-    # 각 청크 요약 미리보기
-    echo "$SUMMARY_RESULT" | jq -r '.chunk_summaries | to_entries[] | "\n### \(.key)\n\(.value | .[0:200])...\n"'
+    # 청크 수 확인
+    NUM_SUMMARIES=$(echo "$SUMMARY_RESULT" | jq -r '.chunk_summaries | length')
+    echo "Total summaries: $NUM_SUMMARIES"
+    echo
+    
+    # 각 청크 요약 미리보기 (처음 3개만)
+    echo "Preview (first 3 chunks):"
+    echo "$SUMMARY_RESULT" | jq -r '.chunk_summaries | to_entries[0:3][] | "\n### \(.key)\n\(.value | .[0:200])...\n"'
   else
     echo
     echo "❌ Chunk summarization failed"
@@ -123,6 +138,78 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo
     echo "Error response:"
     echo "$SUMMARY_RESULT" | head -n 20
+    echo
+    echo "💡 Check server logs: docker logs paper-processor --tail 50"
+    echo
+  fi
+  
+  echo
+  echo "----------------------------------------------"
+fi
+
+# 최종 분석 테스트 (옵션) - 새로 추가!
+read -p "📋 Continue with final analysis? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+  echo "6.5️⃣  Final Analysis (without hierarchical)"
+  echo "⏱️  This may take 2-3 minutes..."
+  
+  START_TIME=$(date +%s)
+  
+  FINAL_RESULT=$(curl -sS -X POST "$BASE_URL/debug/summarize-markdown" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"markdown\": $(echo "$MARKDOWN" | jq -Rs .),
+      \"include_section_summaries\": true,
+      \"include_final_analysis\": true,
+      \"use_hierarchical\": false,
+      \"use_overlap\": true
+    }" 2>&1)
+  
+  END_TIME=$(date +%s)
+  DURATION=$((END_TIME - START_TIME))
+  
+  # 에러 체크
+  if echo "$FINAL_RESULT" | jq -e . >/dev/null 2>&1; then
+    echo
+    echo "✅ Final analysis created"
+    echo "⏱️  Duration: ${DURATION}s"
+    echo
+    
+    # 최종 분석 표시
+    echo "📋 Final Analysis:"
+    echo
+    echo "Title:"
+    echo "$FINAL_RESULT" | jq -r '.final_analysis.title' | sed 's/^/  /'
+    echo
+    echo "Relevance Score:"
+    echo "$FINAL_RESULT" | jq -r '.final_analysis.relevance_score' | sed 's/^/  /'
+    echo
+    echo "Tags:"
+    echo "$FINAL_RESULT" | jq -r '.final_analysis.tags[]' | sed 's/^/  - /'
+    echo
+    echo "Key Contributions:"
+    echo "$FINAL_RESULT" | jq -r '.final_analysis.key_contributions[]' | sed 's/^/  • /'
+    echo
+    echo "Methodology (preview):"
+    echo "$FINAL_RESULT" | jq -r '.final_analysis.methodology | .[0:300]' | sed 's/^/  /'
+    echo "  ..."
+    echo
+    echo "Results (preview):"
+    echo "$FINAL_RESULT" | jq -r '.final_analysis.results | .[0:300]' | sed 's/^/  /'
+    echo "  ..."
+    
+    # 전체 결과 저장
+    echo "$FINAL_RESULT" > v2_final_analysis.json
+    echo
+    echo "💾 Full result saved to: v2_final_analysis.json"
+  else
+    echo
+    echo "❌ Final analysis failed"
+    echo "⏱️  Duration: ${DURATION}s"
+    echo
+    echo "Error response:"
+    echo "$FINAL_RESULT" | head -n 20
     echo
     echo "💡 Check server logs: docker logs paper-processor --tail 50"
     echo
@@ -141,16 +228,21 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
   
   START_TIME=$(date +%s)
   
+  # 임시 파일로 요청 생성
+  cat > /tmp/hierarchical_request.json << EOF
+{
+  "markdown": $(cat "$MARKDOWN_FILE" | jq -Rs .),
+  "include_section_summaries": true,
+  "include_final_analysis": true,
+  "use_hierarchical": true,
+  "use_overlap": true,
+  "show_intermediate_steps": true
+}
+EOF
+  
   HIER_RESULT=$(curl -sS -X POST "$BASE_URL/debug/summarize-markdown" \
     -H "Content-Type: application/json" \
-    -d "{
-      \"markdown\": $(echo "$MARKDOWN" | jq -Rs .),
-      \"include_section_summaries\": true,
-      \"include_final_analysis\": true,
-      \"use_hierarchical\": true,
-      \"use_overlap\": true,
-      \"show_intermediate_steps\": true
-    }" 2>&1)
+    -d @/tmp/hierarchical_request.json 2>&1)
   
   END_TIME=$(date +%s)
   DURATION=$((END_TIME - START_TIME))
@@ -169,24 +261,26 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     # Beginning 요약
     echo
     echo "### Beginning (앞 1/3)"
-    echo "$HIER_RESULT" | jq -r '.intermediate_steps.intermediate_summaries.beginning | .[0:300]'
-    echo "..."
+    echo "$HIER_RESULT" | jq -r '.intermediate_steps.intermediate_summaries.beginning | .[0:300]' | sed 's/^/  /'
+    echo "  ..."
     
-    # Middle 요약
-    echo
-    echo "### Middle (중간 1/3)"
-    echo "$HIER_RESULT" | jq -r '.intermediate_steps.intermediate_summaries.middle | .[0:300]'
-    echo "..."
+    # Middle 요약 (있으면)
+    if echo "$HIER_RESULT" | jq -e '.intermediate_steps.intermediate_summaries.middle' >/dev/null 2>&1; then
+      echo
+      echo "### Middle (중간 1/3)"
+      echo "$HIER_RESULT" | jq -r '.intermediate_steps.intermediate_summaries.middle | .[0:300]' | sed 's/^/  /'
+      echo "  ..."
+    fi
     
     # End 요약
     echo
     echo "### End (뒤 1/3)"
-    echo "$HIER_RESULT" | jq -r '.intermediate_steps.intermediate_summaries.end | .[0:300]'
-    echo "..."
+    echo "$HIER_RESULT" | jq -r '.intermediate_steps.intermediate_summaries.end | .[0:300]' | sed 's/^/  /'
+    echo "  ..."
     
     # 최종 분석
     echo
-    echo "📋 Final Analysis:"
+    echo "📋 Final Analysis (with Hierarchical):"
     echo "$HIER_RESULT" | jq '.final_analysis | {
       title,
       relevance_score,
@@ -226,3 +320,6 @@ echo "💡 Next steps:"
 echo "  - Review chunk structure: cat v2_test_result.json | jq '.chunks_detected'"
 echo "  - Review intermediate summaries: cat v2_test_result.json | jq '.intermediate_steps'"
 echo "  - Compare with other papers to see different chunking strategies"
+
+# Cleanup temp files
+rm -f /tmp/chunk_test_request.json /tmp/summary_request.json /tmp/hierarchical_request.json
