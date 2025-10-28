@@ -102,7 +102,7 @@ CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL")
 CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN")
 CONFLUENCE_SPACE_KEY = os.getenv("CONFLUENCE_SPACE_KEY")
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 
 # ===== boto3 client =====
 boto_config = Config(
@@ -1084,12 +1084,19 @@ async def process_s3_papers(request: S3PapersRequest):
                     except Exception: pass
 
         analyses: List[PaperAnalysis] = []
+        papers_metadata: List[Dict] = []
         errors: List[str] = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futs = [ex.submit(_process_one, p) for p in papers]
             for fut in as_completed(futs):
-                a, err = fut.result()
-                if a: analyses.append(a)
+                a, meta, err = fut.result()  # ⭐ meta 받기
+                if a: 
+                    analyses.append(a)
+                    if meta:
+                        papers_metadata.append({
+                            's3_key': a.source_file,
+                            'images_info': meta.get('images_info')
+                        })
                 if err: errors.append(err)
 
         week_label = request.week_label or derive_week_label(prefix)
@@ -1110,6 +1117,7 @@ async def process_s3_papers(request: S3PapersRequest):
             "week_label": week_label,
             "md_filename": md_filename,
             "md_content": md_content,
+            "papers_metadata": papers_metadata,
             "confluence_url": (confluence_result or {}).get("page_url"),
             "improvements_used": {
                 "hierarchical": request.use_hierarchical,
