@@ -185,6 +185,48 @@ def _preview(text: str, limit: int) -> str:
         return text
     return text[:limit] + "\n...\n(truncated)"
 
+def get_paper_list_from_s3(bucket: str, prefix: str) -> Optional[List[str]]:
+    """
+    S3에서 paper_list.txt 파일을 읽어 URL 리스트 반환
+    
+    Args:
+        bucket: S3 버킷명
+        prefix: S3 prefix (예: kai_papers/w43)
+    
+    Returns:
+        URL 리스트 또는 None (파일 없음)
+    """
+    paper_list_key = f"{prefix.rstrip('/')}/paper_list.txt"
+    
+    try:
+        logger.info(f"Checking for paper list: s3://{bucket}/{paper_list_key}")
+        
+        response = s3_client.get_object(Bucket=bucket, Key=paper_list_key)
+        content = response['Body'].read().decode('utf-8')
+        
+        # URL 파싱 (빈 줄, 주석 제외)
+        urls = []
+        for line in content.splitlines():
+            line = line.strip()
+            # 빈 줄이나 # 주석 제외
+            if not line or line.startswith('#'):
+                continue
+            # URL 형식 확인
+            if line.startswith('http'):
+                urls.append(line)
+            else:
+                logger.warning(f"Invalid URL format: {line}")
+        
+        logger.info(f"Found {len(urls)} URLs in paper_list.txt")
+        return urls if urls else None
+        
+    except s3_client.exceptions.NoSuchKey:
+        logger.info(f"paper_list.txt not found: {paper_list_key}")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading paper_list.txt: {e}")
+        return None
+
 def get_s3_papers(
     bucket: str,
     prefix: str,
@@ -294,7 +336,7 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
             raise Exception("Docpamin: no markdown in export")
         logger.info(f"Docpamin parsed OK (md_len={len(md)})")
         
-        # ⭐ 이미지 전처리: base64 제거, 대표 이미지 추출
+        # 이미지 전처리: base64 제거, 대표 이미지 추출
         md_cleaned, extracted_images = process_markdown_images(
             md, 
             remove_for_llm=True,  # LLM 입력용으로 base64 제거
@@ -314,6 +356,174 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
     except Exception as e:
         logger.error(f"Docpamin error: {e}")
         raise
+
+def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, Dict]:
+    """
+    URL을 사용하여 Docpamin으로 PDF 파싱
+    
+    Args:
+        pdf_url: PDF URL
+        arxiv_id: arXiv ID (임시 제목용)
+    
+    Returns:
+        (markdown, metadata)
+    """
+    logger.info(f"Parsing via Docpamin (URL): {pdf_url}")
+    headers = {"Authorization": f"Bearer {DOCPAMIN_API_KEY}"}
+    session = requests.Session()
+    session.headers.update(headers)
+    REQ_TIMEOUT = 30
+
+    try:
+        data = {
+            "file_url": pdf_url,
+            "alarm_options": json.dumps({"enabled": False}),
+            "workflow_options": json.dumps({
+                "workflow": "dp-o1",
+                "image_export_mode": "embedded"
+            }),
+        }
+        
+        r = session.post(
+            f"{DOCPAMIN_BASE_URL}/tasks", 
+            data=data,
+            verify=DOCPAMIN_CRT_FILE, 
+            timeout=REQ_TIMEOUT
+        )
+        r.raise_for_status()
+        task_id = r.json().get("task_id")
+        if not task_id:
+            raise Exception("Docpamin: no task_id returned")
+
+        logger.info(f"Docpamin task: {task_id}")
+        
+        # 상태 폴링
+        max_wait, waited, backoff = 600, 0, 2
+        while waited < max_wait:
+            s = session.get(
+                f"{DOCPAMIN_BASE_URL}/tasks/{task_id}",
+                verify=DOCPAMIN_CRT_FILE, 
+                timeout=REQ_TIMEOUT
+            )
+            s.raise_for_status()
+            status = s.json().get("status")
+            if status == "DONE":
+                break
+            if status in {"FAILED", "ERROR"}:
+                raise Exception(f"Docpamin task failed: {status}")
+            time.sleep(backoff)
+            waited += backoff
+            backoff = min(backoff * 1.5, 10)
+        
+        if waited >= max_wait:
+            raise Exception("Docpamin timeout")
+
+        # Export
+        opts = {"task_ids": [task_id], "output_types": ["markdown", "json"]}
+        e = session.post(
+            f"{DOCPAMIN_BASE_URL}/tasks/export", 
+            json=opts,
+            verify=DOCPAMIN_CRT_FILE, 
+            timeout=REQ_TIMEOUT
+        )
+        e.raise_for_status()
+
+        md, meta = "", {}
+        with zipfile.ZipFile(io.BytesIO(e.content)) as zf:
+            for fn in zf.namelist():
+                with zf.open(fn) as fh:
+                    if fn.endswith(".md"):
+                        s = fh.read().decode("utf-8", errors="ignore")
+                        if len(s) > len(md):
+                            md = s
+                    elif fn.endswith(".json"):
+                        try:
+                            meta = json.loads(fh.read().decode("utf-8", errors="ignore"))
+                        except Exception:
+                            pass
+        
+        if not md:
+            raise Exception("Docpamin: no markdown in export")
+        
+        paper_title = extract_title_from_markdown(md)
+        meta['extracted_title'] = paper_title
+        
+        logger.info(f"Docpamin parsed OK (md_len={len(md)}, title={paper_title})")
+        
+        # 이미지 전처리
+        md_cleaned, extracted_images = process_markdown_images(
+            md, 
+            remove_for_llm=True,
+            keep_representative=1
+        )
+        
+        if extracted_images:
+            representative = select_representative_images(
+                extracted_images, 
+                max_count=1,
+                paper_title=paper_title
+            )
+            
+            meta['images_info'] = {
+                'total_images': len(extracted_images),
+                'representative_images': representative
+            }
+            logger.info(f"Image preprocessing: {len(extracted_images)} total, selected Figure {representative[0]['index']+1}")
+        
+        return md_cleaned, meta
+        
+    except Exception as e:
+        logger.error(f"Docpamin error: {e}")
+        raise
+
+def extract_title_from_url(url: str) -> str:
+    """
+    URL에서 논문 제목 추출
+    
+    Args:
+        url: arXiv URL (예: https://arxiv.org/pdf/2312.12391.pdf)
+    
+    Returns:
+        제목 (arXiv ID)
+    """
+    # arXiv ID 추출
+    match = re.search(r'(\d{4}\.\d{5})', url)
+    if match:
+        return match.group(1)
+    
+    # 일반 URL에서 파일명 추출
+    from urllib.parse import urlparse
+    path = urlparse(url).path
+    return Path(path).stem or "unknown"
+
+def extract_title_from_markdown(markdown: str) -> str:
+    """
+    Docpamin markdown에서 논문 제목 추출
+    
+    Args:
+        markdown: Docpamin이 반환한 markdown
+    
+    Returns:
+        논문 제목 (첫 번째 ## 헤딩)
+    """
+    try:
+        # 첫 번째 ## 헤딩 찾기
+        lines = markdown.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('##') and not line.startswith('###'):
+                # ## 제거하고 제목만 추출
+                title = line.lstrip('#').strip()
+                if title:
+                    logger.info(f"Extracted title from markdown: {title}")
+                    return title
+        
+        logger.warning("No title found in markdown")
+        return "Unknown"
+        
+    except Exception as e:
+        logger.error(f"Error extracting title: {e}")
+        return "Unknown"
 
 # ===== Image Processing =====
 def process_markdown_images(
@@ -377,32 +587,102 @@ def process_markdown_images(
     
     return processed_md, images
 
-def select_representative_images(images: List[Dict], max_count: int = 1) -> List[Dict]:
+def select_representative_image_with_llm(images: List[Dict], paper_title: str = "") -> Dict:
     """
-    대표 이미지 선택 (크기 기준 - 큰 이미지 = 주요 figure)
+    LLM을 사용하여 가장 대표적인 이미지 선택
     
     Args:
-        images: 추출된 이미지 리스트
-        max_count: 선택할 최대 이미지 개수
+        images: 이미지 리스트 (각각 index, caption, size_kb 포함)
+        paper_title: 논문 제목 (컨텍스트용)
     
     Returns:
-        선택된 대표 이미지 리스트
+        선택된 이미지 딕셔너리
+    """
+    if not images:
+        return None
+    
+    if len(images) == 1:
+        return images[0]
+    
+    try:
+        # 이미지 정보 포맷
+        image_descriptions = []
+        for img in images:
+            desc = f"Figure {img['index'] + 1}"
+            if img.get('alt') and img['alt'] != 'Image':
+                desc += f": {img['alt']}"
+            desc += f" (Size: {img['size_kb']:.1f}KB)"
+            image_descriptions.append(desc)
+        
+        # 프롬프트
+        prompt = f"""You are analyzing a research paper titled: "{paper_title}"
+
+Below is a list of figures from this paper. Select the ONE figure that best represents the main contribution or overview of the paper. 
+
+Prioritize figures that show:
+1. Overall architecture/framework diagrams
+2. System overview illustrations
+3. Main workflow diagrams
+
+Avoid selecting:
+- Detailed experimental result graphs
+- Comparison tables
+- Ablation study charts
+- Small component diagrams
+
+Figures:
+{chr(10).join(f"{i+1}. {desc}" for i, desc in enumerate(image_descriptions))}
+
+Respond with ONLY the number (1-{len(images)}) of the best representative figure. No explanation needed."""
+
+        # call_llm 사용
+        messages = [{"role": "user", "content": prompt}]
+        response = call_llm(messages, max_tokens=10)
+        
+        # 숫자 추출
+        response_text = response.strip()
+        numbers = re.findall(r'\d+', response_text)
+        
+        if not numbers:
+            raise ValueError(f"No number found in LLM response: {response_text}")
+        
+        selected_num = int(numbers[0])
+        selected_idx = selected_num - 1
+        
+        if 0 <= selected_idx < len(images):
+            logger.info(f"LLM selected Figure {selected_num} as representative image (from response: '{response_text}')")
+            return images[selected_idx]
+        else:
+            logger.warning(f"LLM returned invalid index: {selected_num} (valid: 1-{len(images)}), using largest")
+            return max(images, key=lambda x: x['size_kb'])
+            
+    except Exception as e:
+        logger.error(f"LLM image selection failed: {e}, falling back to size-based")
+        return max(images, key=lambda x: x['size_kb'])
+
+
+def select_representative_images(images: List[Dict], max_count: int = 1, paper_title: str = "") -> List[Dict]:
+    """
+    논문의 대표 이미지 선택 (LLM 기반)
+    
+    Args:
+        images: 이미지 리스트
+        max_count: 최대 선택 개수 (현재는 1개만)
+        paper_title: 논문 제목
+    
+    Returns:
+        선택된 이미지 리스트
     """
     if not images:
         return []
     
-    # 크기 순 정렬 (큰 이미지가 보통 더 중요)
-    sorted_imgs = sorted(images, key=lambda x: x['size'], reverse=True)
+    if len(images) <= max_count:
+        return images[:max_count]
     
-    representatives = sorted_imgs[:max_count]
-    
-    indices = [img['index'] for img in representatives]
-    sizes = [format(img['size'], ',') for img in representatives]
-    
-    logger.info(f"Selected {len(representatives)} representative image(s): "
-               f"indices {indices}, sizes {sizes}")
-    
-    return representatives
+    # LLM으로 대표 이미지 선택
+    selected = select_representative_image_with_llm(images, paper_title)
+    return [selected] if selected else []
+
 
 # ===== LLM utils =====
 def _estimate_tokens(s: str) -> int:
@@ -966,40 +1246,159 @@ def derive_week_label(prefix: str) -> str:
     iso_year, iso_week, _ = datetime.utcnow().isocalendar()
     return f"w{iso_week}"
 
-def build_markdown(analyses: List[PaperAnalysis], week_label: str, prefix: str) -> Tuple[str, str]:
+def build_markdown(
+    analyses: List[PaperAnalysis], 
+    papers_metadata: Optional[List[Dict]] = None,
+    week_label: str = "", 
+    prefix: str = ""
+) -> Tuple[str, str]:
+    """
+    논문 분석 결과를 Markdown으로 변환
+    """
     if not week_label:
         week_label = derive_week_label(prefix)
-    header = textwrap.dedent(f"""\
-    # AI Paper Newsletter – {week_label}
-    _Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_
+    
+    header = f"""# AI Paper Newsletter – {week_label}
+_Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_
 
-    Source prefix: `{prefix}`
+Source prefix: `{prefix}`
 
-    ---
-    """)
+---
+
+"""
+    
+    # 이미지 매핑 생성
+    image_map = {}
+    if papers_metadata:
+        for meta in papers_metadata:
+            if meta.get('images_info') and meta.get('images_info', {}).get('representative_images'):
+                s3_key = meta.get('s3_key', '')
+                image_map[s3_key] = meta['images_info']
+    
     parts = [header]
+    
     for i, a in enumerate(analyses, 1):
         tags = f"**Tags:** {', '.join(a.tags)}" if a.tags else ""
         authors = f"**Authors:** {', '.join(a.authors[:8])}" if a.authors else ""
+        
         abstract_block = ""
         if a.abstract and a.abstract.strip():
-            abstract_block = "\n**Abstract**\n\n> " + a.abstract.strip() + "\n"
-        sec = textwrap.dedent(f"""\
-        ## {i}. {a.title}
-        {authors}
-        {tags}
+            abstract_block = f"\n**Abstract**\n\n> {a.abstract.strip()}\n\n"
+        
+        # ⭐ Summary JSON 파싱 및 개조식 변환
+        summary_formatted = format_summary_as_markdown(a.summary)
+        
+        sec = f"""## {i}. {a.title}
 
-        **Summary**
-        {a.summary.strip()}
+{authors}
+{tags}
 
-        {abstract_block}**Source:** `s3://{a.source_file}`
+{summary_formatted}
 
-        ---
-        """)
+{abstract_block}"""
+        
+        # 이미지 섹션 추가
+        if a.source_file in image_map:
+            img_info = image_map[a.source_file]
+            rep_imgs = img_info.get('representative_images', [])
+            
+            if rep_imgs:
+                rep_img = rep_imgs[0]
+                paper_name = Path(a.source_file).stem
+                img_filename = f"{week_label}_{paper_name}_fig{rep_img['index'] + 1}.{rep_img['type']}"
+                
+                sec += f"""### 📊 대표 이미지
+
+**전체 이미지:** {img_info['total_images']}개  
+**대표 이미지:** Figure {rep_img['index'] + 1} ({rep_img['size_kb']:.1f}KB)
+
+![Figure {rep_img['index'] + 1}](images/{img_filename})
+
+"""
+        
+        sec += f"""**Source:** `s3://{a.source_file}`
+
+---
+
+"""
         parts.append(sec)
-    md_content = "\n".join(parts)
+    
+    md_content = "".join(parts)
     md_filename = f"{week_label}.md"
     return md_filename, md_content
+
+
+def format_summary_as_markdown(summary: str) -> str:
+    """
+    Summary JSON을 보기 좋은 Markdown 개조식으로 변환
+    
+    Args:
+        summary: JSON 형태의 summary 문자열
+    
+    Returns:
+        포맷팅된 Markdown 문자열
+    """
+    try:
+        # JSON 추출 시도
+        summary_clean = summary.strip().replace('~', '–')
+        
+        # JSON 파싱
+        json_match = re.search(r'\{[\s\S]*\}', summary_clean)
+        if not json_match:
+            # JSON이 없으면 원본 반환
+            return f"**Summary**\n\n{summary_clean}\n"
+        
+        data = json.loads(json_match.group(0))
+        
+        # Markdown 개조식으로 변환
+        lines = ["**Summary**\n"]
+        
+        # TL;DR
+        if data.get('tldr'):
+            lines.append(f"**📌 TL;DR**\n")
+            lines.append(f"{data['tldr']}\n\n")
+        
+        # 핵심 기여
+        if data.get('key_contributions'):
+            lines.append(f"**🎯 핵심 기여**\n")
+            for contrib in data['key_contributions']:
+                lines.append(f"- {contrib}\n")
+            lines.append("\n")
+        
+        # 방법론
+        if data.get('methodology'):
+            lines.append(f"**🔬 방법론**\n")
+            lines.append(f"{data['methodology']}\n\n")
+        
+        # 결과
+        if data.get('results'):
+            lines.append(f"**📊 결과**\n")
+            lines.append(f"{data['results']}\n\n")
+        
+        # 새로운 점
+        if data.get('novelty'):
+            lines.append(f"**💡 새로운 점**\n")
+            lines.append(f"{data['novelty']}\n\n")
+        
+        # 한계점
+        if data.get('limitations'):
+            lines.append(f"**⚠️ 한계점**\n")
+            for limitation in data['limitations']:
+                lines.append(f"- {limitation}\n")
+            lines.append("\n")
+        
+        # Relevance Score
+        if data.get('relevance_score'):
+            score = data['relevance_score']
+            stars = '⭐' * score
+            lines.append(f"**관련성 점수:** {stars} ({score}/10)\n\n")
+        
+        return "".join(lines)
+        
+    except Exception as e:
+        # JSON 파싱 실패 시 원본 반환
+        logger.warning(f"Failed to parse summary JSON: {e}")
+        return f"**Summary**\n\n{summary.strip().replace('~', '–')}\n"
 
 # ===== Main Routes =====
 @app.get("/")
@@ -1044,16 +1443,36 @@ async def process_s3_papers(request: S3PapersRequest):
     logger.info(f"Processing S3 papers (hierarchical={request.use_hierarchical}, overlap={request.use_overlap})")
     bucket = request.bucket or S3_BUCKET
     prefix = request.prefix or S3_PAPERS_PREFIX
+    
     try:
-        papers = get_s3_papers(
-            bucket=bucket,
-            prefix=prefix,
-            file_pattern=request.file_pattern or "*.pdf",
-            process_subdirectories=request.process_subdirectories,
-        )
+        # 1단계: paper_list.txt 확인
+        paper_urls = get_paper_list_from_s3(bucket, prefix)
+        
+        if paper_urls:
+            # URL 기반 처리
+            logger.info(f"Processing {len(paper_urls)} papers from paper_list.txt")
+            papers = [
+                {
+                    "title": extract_title_from_url(url),
+                    "url": url,
+                    "source": "url",
+                    "s3_key": f"{prefix}/{extract_title_from_url(url)}.pdf"  # 가상 경로
+                }
+                for url in paper_urls
+            ]
+        else:
+            # 기존 PDF 파일 기반 처리
+            logger.info("paper_list.txt not found, processing PDF files")
+            papers = get_s3_papers(
+                bucket=bucket,
+                prefix=prefix,
+                file_pattern=request.file_pattern or "*.pdf",
+                process_subdirectories=request.process_subdirectories,
+            )
+        
         if not papers:
             return {
-                "message": "No papers found in S3",
+                "message": "No papers found",
                 "papers_found": 0,
                 "papers_processed": 0,
                 "bucket": bucket,
@@ -1062,12 +1481,37 @@ async def process_s3_papers(request: S3PapersRequest):
                 "md_content": "",
             }
 
-        def _process_one(p: Dict) -> Tuple[Optional[PaperAnalysis], Optional[str]]:
+        def _process_one(p: Dict) -> Tuple[Optional[PaperAnalysis], Optional[Dict], Optional[str]]:
+            """논문 1개 처리"""
             tmp = None
             try:
-                tmp = download_pdf_from_s3(p["s3_key"], p["s3_bucket"])
-                md, meta = parse_pdf_with_docpamin(tmp)
-                info = {"title": p["title"], "authors": [], "abstract": "", "s3_key": p["s3_key"]}
+                # URL 기반 vs 파일 기반 처리
+                if p.get("source") == "url":
+                    # URL에서 직접 파싱
+                    md, meta = parse_pdf_with_docpamin_url(p["url"], p["title"])
+                    
+                    actual_title = meta.get('extracted_title', p["title"])
+                    info = {
+                        "title": actual_title,
+                        "authors": [], 
+                        "abstract": "", 
+                        "s3_key": p["s3_key"]
+                    }
+                else:
+                    # S3에서 다운로드 후 파싱
+                    tmp = download_pdf_from_s3(p["s3_key"], p["s3_bucket"])
+                    md, meta = parse_pdf_with_docpamin(tmp)
+                    
+                    actual_title = extract_title_from_markdown(md) if md else p["title"]
+                    meta['extracted_title'] = actual_title
+                    
+                    info = {
+                        "title": actual_title,
+                        "authors": [], 
+                        "abstract": "", 
+                        "s3_key": p["s3_key"]
+                    }
+                
                 a, _ = analyze_paper_with_llm_improved(
                     info, md, meta,
                     use_hierarchical=request.use_hierarchical,
@@ -1075,9 +1519,10 @@ async def process_s3_papers(request: S3PapersRequest):
                     return_intermediate=False
                 )
                 a.source_file = p["s3_key"]
-                return a, None
+                return a, meta, None
+                
             except Exception as e:
-                return None, f"{p['s3_key']}: {e}"
+                return None, None, f"{p.get('title', 'unknown')}: {e}"
             finally:
                 if tmp and os.path.exists(tmp):
                     try: os.unlink(tmp)
@@ -1086,21 +1531,24 @@ async def process_s3_papers(request: S3PapersRequest):
         analyses: List[PaperAnalysis] = []
         papers_metadata: List[Dict] = []
         errors: List[str] = []
+        
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futs = [ex.submit(_process_one, p) for p in papers]
             for fut in as_completed(futs):
-                a, meta, err = fut.result()  # ⭐ meta 받기
+                a, meta, err = fut.result()
                 if a: 
                     analyses.append(a)
-                    if meta:
+                    if meta and meta.get('images_info'):
                         papers_metadata.append({
                             's3_key': a.source_file,
-                            'images_info': meta.get('images_info')
+                            'title': a.title,
+                            'images_info': meta['images_info']
                         })
-                if err: errors.append(err)
+                if err: 
+                    errors.append(err)
 
         week_label = request.week_label or derive_week_label(prefix)
-        md_filename, md_content = build_markdown(analyses, week_label, prefix)
+        md_filename, md_content = build_markdown(analyses, papers_metadata, week_label, prefix)
 
         confluence_result = None
         if request.upload_confluence and analyses:
@@ -1118,6 +1566,7 @@ async def process_s3_papers(request: S3PapersRequest):
             "md_filename": md_filename,
             "md_content": md_content,
             "papers_metadata": papers_metadata,
+            "source": "url_list" if paper_urls else "pdf_files",
             "confluence_url": (confluence_result or {}).get("page_url"),
             "improvements_used": {
                 "hierarchical": request.use_hierarchical,
