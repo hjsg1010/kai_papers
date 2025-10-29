@@ -61,6 +61,51 @@ def extract_base64_images(markdown: str) -> List[Dict]:
         })
     return images
 
+def extract_figure_caption(markdown: str, figure_index: int) -> str:
+    """
+    Markdown에서 특정 Figure의 caption 추출
+    
+    Args:
+        markdown: 전체 markdown
+        figure_index: Figure 번호 (0-based)
+    
+    Returns:
+        Figure caption 텍스트
+    """
+    try:
+        # Figure 번호 (1-based로 검색)
+        fig_num = figure_index + 1
+        
+        # 패턴들 시도
+        patterns = [
+            # "Figure 1: Caption text"
+            rf'Figure\s+{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
+            # "Fig. 1: Caption text"
+            rf'Fig\.?\s+{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
+            # "Figure 1. Caption text"
+            rf'Figure\s+{fig_num}\.\s*([^\n]+?)(?:\n|$)',
+            # "**Figure 1:** Caption text"
+            rf'\*\*Figure\s+{fig_num}\*\*[:\.]?\s*([^\n]+?)(?:\n|$)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, markdown, re.IGNORECASE)
+            if match:
+                caption = match.group(1).strip()
+                # 너무 짧거나 의미없는 caption 제외
+                if len(caption) > 10 and not caption.startswith('!['):
+                    # 최대 200자로 제한
+                    caption = caption[:200] if len(caption) > 200 else caption
+                    logger.info(f"Found caption for Figure {fig_num}: {caption[:50]}...")
+                    return caption
+        
+        logger.debug(f"No caption found for Figure {fig_num}")
+        return ""
+        
+    except Exception as e:
+        logger.error(f"Error extracting caption for Figure {figure_index + 1}: {e}")
+        return ""
+
 def select_representative_image(images: List[Dict], min_kb: float = 10, max_kb: float = 200) -> Optional[Dict]:
     """대표 이미지 선정 (크기 + 위치 기준)"""
     if not images:
@@ -334,6 +379,9 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
                             pass
         if not md:
             raise Exception("Docpamin: no markdown in export")
+
+        paper_title = extract_title_from_markdown(md)
+        meta['extracted_title'] = paper_title
         logger.info(f"Docpamin parsed OK (md_len={len(md)})")
         
         # 이미지 전처리: base64 제거, 대표 이미지 추출
@@ -345,9 +393,14 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
         
         # 메타데이터에 이미지 정보 추가
         if extracted_images:
+            representative = select_representative_images(
+                extracted_images, 
+                max_count=1,
+                paper_title=paper_title
+            )
             meta['images_info'] = {
                 'total_images': len(extracted_images),
-                'representative_images': select_representative_images(extracted_images, max_count=1)
+                'representative_images': representative
             }
             logger.info(f"Image preprocessing: {len(extracted_images)} images, "
                        f"markdown size reduced from {len(md)} to {len(md_cleaned)} chars")
@@ -532,17 +585,8 @@ def process_markdown_images(
     keep_representative: int = 1
 ) -> Tuple[str, List[Dict]]:
     """
-    Markdown에서 이미지 처리
-    
-    Args:
-        markdown: 원본 markdown (base64 이미지 포함)
-        remove_for_llm: LLM 요약용으로 이미지 제거 여부
-        keep_representative: 최종 결과물에 포함할 대표 이미지 개수
-    
-    Returns:
-        (processed_markdown, extracted_images)
+    Markdown에서 이미지 처리 + Caption 추출
     """
-    # Base64 이미지 패턴: ![alt](data:image/png;base64,...)
     pattern = r'!\[(.*?)\]\(data:image/([^;]+);base64,([A-Za-z0-9+/=]+)\)'
     
     images = []
@@ -560,43 +604,37 @@ def process_markdown_images(
             'alt': alt_text.strip(),
             'type': img_type,
             'size': img_size,
-            'size_kb': img_size * 3 / 4 / 1024,  # ⭐ 추가!
-            'base64_data': base64_data,          # ⭐ 추가!
+            'size_kb': img_size * 3 / 4 / 1024,
+            'base64_data': base64_data,
             'full': full_img
         })
         
         if remove_for_llm:
-            # LLM용: 이미지를 캡션 플레이스홀더로 대체
             if alt_text.strip():
                 return f"\n[Figure {len(images)}: {alt_text}]\n"
             else:
                 return f"\n[Figure {len(images)}]\n"
         else:
-            # 원본 유지
             return full_img
     
-    # 이미지 추출 및 처리
+    # 이미지 추출
     processed_md = re.sub(pattern, extract_image, markdown)
     
+    # Caption 추출 (원본 markdown 사용)
     if images:
+        for img in images:
+            caption = extract_figure_caption(markdown, img['index'])
+            if caption:
+                img['caption'] = caption
+        
         total_img_size = sum(img['size'] for img in images)
-        logger.info(f"Processed {len(images)} images. "
-                   f"Total image data: {total_img_size:,} chars")
-        logger.info(f"Size reduction: {len(markdown) - len(processed_md):,} chars "
-                   f"({100 * (1 - len(processed_md) / len(markdown)):.1f}%)")
+        logger.info(f"Processed {len(images)} images. Total: {total_img_size:,} chars")
     
     return processed_md, images
 
 def select_representative_image_with_llm(images: List[Dict], paper_title: str = "") -> Dict:
     """
-    LLM을 사용하여 가장 대표적인 이미지 선택
-    
-    Args:
-        images: 이미지 리스트 (각각 index, caption, size_kb 포함)
-        paper_title: 논문 제목 (컨텍스트용)
-    
-    Returns:
-        선택된 이미지 딕셔너리
+    LLM을 사용하여 가장 대표적인 이미지 선택 (Caption 포함)
     """
     if not images:
         return None
@@ -605,12 +643,17 @@ def select_representative_image_with_llm(images: List[Dict], paper_title: str = 
         return images[0]
     
     try:
-        # 이미지 정보 포맷
+        # 이미지 정보 포맷 (Caption 우선 사용)
         image_descriptions = []
         for img in images:
             desc = f"Figure {img['index'] + 1}"
-            if img.get('alt') and img['alt'] != 'Image':
+            
+            # Caption 우선 (markdown에서 추출)
+            if img.get('caption'):
+                desc += f": {img['caption']}"
+            elif img.get('alt') and img['alt'] != 'Image':
                 desc += f": {img['alt']}"
+            
             desc += f" (Size: {img['size_kb']:.1f}KB)"
             image_descriptions.append(desc)
         
@@ -619,16 +662,20 @@ def select_representative_image_with_llm(images: List[Dict], paper_title: str = 
 
 Below is a list of figures from this paper. Select the ONE figure that best represents the main contribution or overview of the paper. 
 
-Prioritize figures that show:
+Prioritize figures that show (Important): 
 1. Overall architecture/framework diagrams
-2. System overview illustrations
+2. System overview illustrations 
 3. Main workflow diagrams
 
 Avoid selecting:
-- Detailed experimental result graphs
+- Detailed experimental result graphs or tables
 - Comparison tables
 - Ablation study charts
 - Small component diagrams
+
+Consider:
+- Representative figure's caption usually include keywords such as **"Architecture," "Overview,"** or **"main workflow."**
+- Image size is the least opponent that you should consider.
 
 Figures:
 {chr(10).join(f"{i+1}. {desc}" for i, desc in enumerate(image_descriptions))}
@@ -637,7 +684,7 @@ Respond with ONLY the number (1-{len(images)}) of the best representative figure
 
         # call_llm 사용
         messages = [{"role": "user", "content": prompt}]
-        response = call_llm(messages, max_tokens=10)
+        response = call_llm(messages, max_tokens=1000)
         
         # 숫자 추출
         response_text = response.strip()
@@ -690,25 +737,66 @@ def _estimate_tokens(s: str) -> int:
     return max(1, math.ceil(len(s) / 4))
 
 def call_llm(messages: List[Dict], max_tokens: int = 2000) -> str:
-    """LLM API 호출"""
+    """LLM API 호출 (reasoning model 지원)"""
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": LLM_MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2}
     try:
-        # trailing slash 제거하여 이중 슬래시 방지
         base_url = LLM_BASE_URL.rstrip('/') if LLM_BASE_URL else ""
         url = f"{base_url}/chat/completions"
         
-        logger.info(f"Calling LLM: {url} (model: {LLM_MODEL})")
+        logger.info(f"Calling LLM: {url} (model: {LLM_MODEL}, max_tokens: {max_tokens})")
         
         r = requests.post(url, headers=headers, json=payload, timeout=120)
         r.raise_for_status()
         j = r.json()
-        return j["choices"][0]["message"]["content"]
+        
+        if "choices" not in j or not j["choices"]:
+            raise ValueError(f"Invalid response: {list(j.keys())}")
+        
+        message = j["choices"][0].get("message", {})
+        finish_reason = j["choices"][0].get("finish_reason")
+        
+        if finish_reason == "length":
+            logger.warning(f"⚠️  Response truncated due to max_tokens limit!")
+        
+        content = (
+            message.get("content") or 
+            message.get("reasoning_content") or 
+            message.get("text") or 
+            ""
+        )
+        
+        if not content.strip():
+            logger.warning(f"Empty LLM response. finish_reason: {finish_reason}, message keys: {message.keys()}")
+            
+            if "reasoning_content" in message and not message.get("content"):
+                logger.error(f"❌ Only reasoning_content available, no actual answer!")
+                logger.error(f"reasoning_content: {message['reasoning_content'][:200]}")
+                logger.error(f"This usually means max_tokens is too low for reasoning models")
+            
+            return ""
+        
+        if "reasoning_content" in message and "content" not in message:
+            logger.info("⚠️  Using reasoning_content (reasoning model, but content missing)")
+        
+        return content
+        
+    except Exception as e:
+        logger.error(f"LLM call failed: {type(e).__name__}: {e}")
+        raise
+        
     except requests.exceptions.HTTPError as e:
-        logger.error(f"LLM API HTTP Error: {e.response.status_code} - {e.response.text[:200]}")
+        logger.error(f"LLM API HTTP Error: {e.response.status_code}")
+        logger.error(f"Response: {e.response.text[:500]}")
+        raise
+    except ValueError as e:
+        logger.error(f"LLM response format error: {e}")
+        raise
+    except KeyError as e:
+        logger.error(f"LLM response missing key: {e}")
         raise
     except Exception as e:
-        logger.error(f"LLM call failed: {e}")
+        logger.error(f"LLM call failed: {type(e).__name__}: {e}")
         raise
 
 def extract_all_headers(markdown_content: str) -> Dict[str, str]:
@@ -887,7 +975,7 @@ def summarize_chunk_with_overlap(
         chunk_num = chunk_key.split("_")[-1] if "_" in chunk_key else "0"
         prompt = f"논문의 일부분 (Part {chunk_num})을 요약하세요."
     
-    budget_tokens = min(LLM_MAX_TOKENS - 800, 3000)
+    budget_tokens = min(LLM_MAX_TOKENS - 800, 6000)
     approx_tokens = _estimate_tokens(chunk_content)
     
     # 청크가 너무 크면 다시 분할
@@ -901,7 +989,7 @@ def summarize_chunk_with_overlap(
             {"role": "system", "content": "You are an expert AI paper analyst. Keep technical terms in English."},
             {"role": "user", "content": f"[{paper_title}] {prompt}{context_prompt}\n\n내용:\n{chunk_content}"},
         ]
-        return call_llm(msgs, max_tokens=min(1500, LLM_MAX_TOKENS - 500))
+        return call_llm(msgs, max_tokens=min(3000, LLM_MAX_TOKENS - 500))
     
     # 너무 크면 sub-chunk로 분할
     chunk_size_chars = budget_tokens * 4
@@ -921,7 +1009,7 @@ def summarize_chunk_with_overlap(
             {"role": "system", "content": "You are an expert AI paper analyst. Keep technical terms in English."},
             {"role": "user", "content": f"[{paper_title}] {prompt} (sub-part {i+1}/{len(sub_chunks)}){context_prompt}\n\n{sub_chunk}"},
         ]
-        summary = call_llm(msgs, max_tokens=min(1500, LLM_MAX_TOKENS - 500))
+        summary = call_llm(msgs, max_tokens=min(3000, LLM_MAX_TOKENS - 500))
         summaries.append(summary)
         sub_prev_summary = summary
     
@@ -933,7 +1021,7 @@ def summarize_chunk_with_overlap(
         {"role": "system", "content": "You are an expert AI paper analyst."},
         {"role": "user", "content": f"다음은 [{paper_title}]의 '{chunk_key}' 부분을 여러 sub-part로 나눠 요약한 결과입니다. 이를 하나의 일관된 요약으로 병합하세요:\n\n" + "\n\n---\n\n".join(summaries)},
     ]
-    return call_llm(merge_msgs, max_tokens=1200)
+    return call_llm(merge_msgs, max_tokens=3000)
 
 def create_hierarchical_summary_v2(chunk_summaries: Dict[str, str], paper_title: str) -> Dict[str, str]:
     """
@@ -996,7 +1084,7 @@ def create_hierarchical_summary_v2(chunk_summaries: Dict[str, str], paper_title:
             {"role": "user", "content": f"[{paper_title}] {prompt}\n\n{combined}"},
         ]
         
-        intermediate_summaries[group_name] = call_llm(msgs, max_tokens=1000)
+        intermediate_summaries[group_name] = call_llm(msgs, max_tokens=3000)
         logger.info(f"Created intermediate summary for '{group_name}' ({len(group_items)} chunks)")
     
     return intermediate_summaries
@@ -1106,7 +1194,7 @@ def analyze_paper_with_llm_improved(
         {"role": "system", "content": "You are an expert AI/ML researcher. Return ONLY valid JSON."},
         {"role": "user", "content": final_prompt},
     ]
-    final_out = call_llm(msgs, max_tokens=min(2500, LLM_MAX_TOKENS))
+    final_out = call_llm(msgs, max_tokens=min(3000, LLM_MAX_TOKENS))
     parsed = _json_extract(final_out) or {}
     
     # Abstract 추출 (첫 번째 청크에서)
@@ -1351,7 +1439,7 @@ def format_summary_as_markdown(summary: str) -> str:
         data = json.loads(json_match.group(0))
         
         # Markdown 개조식으로 변환
-        lines = ["**Summary**\n"]
+        lines = ["**Summary**  \n\n"]
         
         # TL;DR
         if data.get('tldr'):
@@ -1421,19 +1509,71 @@ async def health_check():
 
 @app.get("/list-s3-papers")
 async def list_s3_papers(bucket: Optional[str] = None, prefix: Optional[str] = None):
+    """
+    S3에서 논문 목록 조회
+    - paper_list.txt가 있으면 URL 리스트 반환
+    - 없으면 PDF 파일 목록 반환
+    """
     bucket = bucket or S3_BUCKET
     prefix = prefix or S3_PAPERS_PREFIX
+    
     try:
-        papers = get_s3_papers(bucket, prefix)
-        return {
-            "bucket": bucket,
-            "prefix": prefix,
-            "papers_found": len(papers),
-            "papers": [
-                {"title": p["title"], "s3_key": p["s3_key"], "last_modified": p["last_modified"], "size_bytes": p.get("size_bytes", 0)}
-                for p in papers
-            ],
-        }
+        paper_urls = get_paper_list_from_s3(bucket, prefix)
+        
+        if paper_urls:
+            logger.info(f"Found paper_list.txt with {len(paper_urls)} URLs")
+            papers = [
+                {
+                    "title": extract_title_from_url(url),
+                    "s3_key": f"{prefix}/{extract_title_from_url(url)}.pdf",  # 가상 경로
+                    "url": url,
+                    "source": "url_list",
+                    "last_modified": None,
+                    "size_bytes": 0
+                }
+                for url in paper_urls
+            ]
+            
+            return {
+                "bucket": bucket,
+                "prefix": prefix,
+                "papers_found": len(papers),
+                "source": "url_list",
+                "paper_list_found": True,
+                "papers": [
+                    {
+                        "title": p["title"],
+                        "s3_key": p["s3_key"],
+                        "url": p.get("url"),
+                        "source": p.get("source"),
+                        "last_modified": p.get("last_modified"),
+                        "size_bytes": p.get("size_bytes", 0)
+                    }
+                    for p in papers
+                ],
+            }
+        else:
+            logger.info("paper_list.txt not found, listing PDF files")
+            papers = get_s3_papers(bucket, prefix)
+            
+            return {
+                "bucket": bucket,
+                "prefix": prefix,
+                "papers_found": len(papers),
+                "source": "pdf_files",
+                "paper_list_found": False,
+                "papers": [
+                    {
+                        "title": p["title"],
+                        "s3_key": p["s3_key"],
+                        "source": p.get("source", "s3"),
+                        "last_modified": p["last_modified"],
+                        "size_bytes": p.get("size_bytes", 0)
+                    }
+                    for p in papers
+                ],
+            }
+            
     except Exception as e:
         logger.error(f"list_s3_papers error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
