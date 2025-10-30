@@ -9,6 +9,7 @@ botocore
 
 # HTTP requests (for Docpamin API and LLM API)
 requests
+httpx
 
 # Confluence
 atlassian-python-api

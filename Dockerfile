@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY paper_processor.py .
+COPY paper_processor ./paper_processor
 
 # Create logs directory
 RUN mkdir -p /app/logs

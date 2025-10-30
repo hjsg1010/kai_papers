@@ -123,7 +123,7 @@ docker-compose up -d
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-python paper_processor.py
+python -m paper_processor
 ```
 
 ### 3. 사용
@@ -192,7 +192,7 @@ LLM_MAX_TOKENS=8192  # 더 긴 문서용
 
 ### 섹션 패턴 커스터마이징
 
-`paper_processor.py`의 `section_patterns` 수정:
+`paper_processor/summary.py`의 청크/섹션 감지 로직 수정:
 
 ```python
 section_patterns = {
@@ -264,7 +264,7 @@ LLM_MAX_TOKENS=8192
 
 ```
 ai-paper-newsletter/
-├── paper_processor.py     # Docpamin + LLM 통합
+├── paper_processor/       # Docpamin + LLM 통합 패키지
 ├── n8n_workflow.json      # 수동 실행 워크플로우
 ├── requirements.txt       # 간소화된 의존성
 ├── Dockerfile            # Docpamin 전용
