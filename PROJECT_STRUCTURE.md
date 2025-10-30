@@ -11,7 +11,7 @@ ai-paper-newsletter/
 ├── 📄 DEPLOYMENT.md               # 배포 가이드
 ├── 📄 PROJECT_STRUCTURE.md        # 이 파일
 │
-├── 🐍 paper_processor.py          # FastAPI 메인 서비스
+├── 📁 paper_processor/            # FastAPI 메인 서비스 패키지
 ├── 🐍 arxiv_example.py            # arXiv API 사용 예제
 ├── 🐍 test_api.py                 # API 테스트 스크립트
 │
@@ -58,19 +58,22 @@ ai-paper-newsletter/
 
 ### 🐍 Python 파일
 
-#### paper_processor.py
-- **역할**: FastAPI 기반 메인 서비스
+#### paper_processor/ 패키지
+- **역할**: FastAPI 기반 메인 서비스 및 유틸리티 모듈 모음
+- **구성**:
+  - `api.py`: FastAPI 엔드포인트 정의
+  - `docpamin.py`, `images.py`, `summary.py` 등: 기능별 유틸리티 분리
+  - `__main__.py`: `python -m paper_processor` 로 앱 실행 지원
 - **주요 기능**:
-  - arXiv 논문 검색 및 다운로드
-  - AWS S3에서 논문 가져오기
-  - Docling으로 PDF 파싱
-  - Claude AI로 논문 분석
-  - Confluence에 결과 업로드
+  - AWS S3에서 논문 가져오기 및 Docpamin 파싱
+  - LLM 기반 요약/분석 및 계층적 리포트 생성
+  - 대표 이미지 선별 및 Markdown/Confluence 업로드 지원
 - **엔드포인트**:
   - `GET /health` - 헬스 체크
-  - `POST /process-arxiv-papers` - arXiv 논문 처리
-  - `POST /process-s3-papers` - S3 논문 처리
-  - `POST /process-all` - 모든 논문 처리
+  - `GET /list-s3-papers` - S3 논문 목록 조회
+  - `POST /process-s3-papers` - S3 또는 paper_list 기반 논문 처리
+  - `POST /batch-process` - 일괄 처리 및 Confluence 업로드
+  - `POST /debug/*` - 디버그용 파싱/요약 API
 
 #### arxiv_example.py
 - **역할**: arXiv API 사용 예제 스크립트
@@ -193,7 +196,7 @@ docker-compose logs -f
 #### 로컬 실행
 ```bash
 # Terminal 1: Paper Processor
-python paper_processor.py
+python -m paper_processor
 
 # Terminal 2: n8n
 n8n start

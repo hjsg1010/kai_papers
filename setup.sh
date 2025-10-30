@@ -142,7 +142,7 @@ elif [ "$install_choice" = "2" ]; then
     echo ""
     echo "To start the services:"
     echo "  1. Activate virtual environment: source venv/bin/activate"
-    echo "  2. Start Paper Processor: python paper_processor.py"
+    echo "  2. Start Paper Processor: python -m paper_processor"
     echo "  3. Start n8n (in another terminal): n8n start"
     
 else
