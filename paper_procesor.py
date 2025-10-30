@@ -29,91 +29,6 @@ load_dotenv(override=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===== Image Preprocessing Functions =====
-
-def remove_base64_images(markdown: str, replacement: str = "[Image]") -> Tuple[str, int]:
-    """
-    Base64 이미지를 플레이스홀더로 대체
-    
-    Returns:
-        (cleaned_markdown, num_removed)
-    """
-    pattern = r'!\[([^\]]*)\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=]+\)'
-    cleaned, count = re.subn(pattern, replacement, markdown)
-    if count > 0:
-        logger.info(f"Removed {count} base64 images from markdown")
-    return cleaned, count
-
-def extract_base64_images(markdown: str) -> List[Dict]:
-    """Markdown에서 base64 이미지 추출"""
-    pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([A-Za-z0-9+/=]+)\)'
-    images = []
-    for match in re.finditer(pattern, markdown):
-        base64_data = match.group(3)
-        size_bytes = len(base64_data) * 3 // 4
-        images.append({
-            'full_match': match.group(0),
-            'alt_text': match.group(1),
-            'mime_type': match.group(2),
-            'base64_data': base64_data,
-            'size_kb': size_bytes / 1024,
-            'position': match.start()
-        })
-    return images
-
-def extract_figure_caption(markdown: str, figure_index: int) -> str:
-    """
-    Markdown에서 특정 Figure의 caption 추출
-    
-    Args:
-        markdown: 전체 markdown
-        figure_index: Figure 번호 (0-based)
-    
-    Returns:
-        Figure caption 텍스트
-    """
-    try:
-        # Figure 번호 (1-based로 검색)
-        fig_num = figure_index + 1
-        
-        # 패턴들 시도
-        patterns = [
-            # "Figure 1: Caption text"
-            rf'Figure\s+{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
-            # "Fig. 1: Caption text"
-            rf'Fig\.?\s+{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
-            # "Figure 1. Caption text"
-            rf'Figure\s+{fig_num}\.\s*([^\n]+?)(?:\n|$)',
-            # "**Figure 1:** Caption text"
-            rf'\*\*Figure\s+{fig_num}\*\*[:\.]?\s*([^\n]+?)(?:\n|$)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, markdown, re.IGNORECASE)
-            if match:
-                caption = match.group(1).strip()
-                # 너무 짧거나 의미없는 caption 제외
-                if len(caption) > 10 and not caption.startswith('!['):
-                    # 최대 200자로 제한
-                    caption = caption[:200] if len(caption) > 200 else caption
-                    logger.info(f"Found caption for Figure {fig_num}: {caption[:50]}...")
-                    return caption
-        
-        logger.debug(f"No caption found for Figure {fig_num}")
-        return ""
-        
-    except Exception as e:
-        logger.error(f"Error extracting caption for Figure {figure_index + 1}: {e}")
-        return ""
-
-def select_representative_image(images: List[Dict], min_kb: float = 10, max_kb: float = 200) -> Optional[Dict]:
-    """대표 이미지 선정 (크기 + 위치 기준)"""
-    if not images:
-        return None
-    candidates = [img for img in images if min_kb <= img['size_kb'] <= max_kb]
-    if not candidates:
-        candidates = sorted(images, key=lambda x: abs(x['size_kb'] - (min_kb + max_kb) / 2))[:3]
-    return min(candidates, key=lambda x: x['position']) if candidates else None
 
 app = FastAPI(
     title="AI Paper Newsletter Processor",
@@ -135,8 +50,6 @@ DOCPAMIN_API_KEY = os.getenv("DOCPAMIN_API_KEY")
 DOCPAMIN_BASE_URL = os.getenv("DOCPAMIN_BASE_URL", "https://docpamin.superaip.samsungds.net/api/v1")
 DOCPAMIN_CRT_FILE = os.getenv("DOCPAMIN_CRT_FILE", "/etc/ssl/certs/ca-certificates.crt")
 
-print(f"crt : {DOCPAMIN_CRT_FILE}")
-
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL")
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
@@ -148,6 +61,7 @@ CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN")
 CONFLUENCE_SPACE_KEY = os.getenv("CONFLUENCE_SPACE_KEY")
 
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+
 
 # ===== boto3 client =====
 boto_config = Config(
@@ -318,6 +232,94 @@ def download_pdf_from_s3(s3_key: str, s3_bucket: str) -> str:
         raise Exception(f"Failed to download PDF: {e}")
 
 # ===== Docpamin =====
+
+
+
+def save_docpamin_cache_to_s3(
+    bucket: str,
+    prefix: str,
+    cache_key: str,
+    markdown: str,
+    metadata: Dict
+):
+    """
+    Docpamin 결과를 S3에 캐싱
+    
+    Args:
+        bucket: S3 버킷
+        prefix: S3 prefix (예: kai_papers/w44)
+        cache_key: 캐시 키
+        markdown: 파싱된 markdown
+        metadata: JSON metadata
+    """
+    try:
+        cache_prefix = f"{prefix.rstrip('/')}/cache"
+        
+        # Markdown 저장
+        md_key = f"{cache_prefix}/{cache_key}.md"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=md_key,
+            Body=markdown.encode('utf-8'),
+            ContentType='text/markdown'
+        )
+        logger.info(f"Saved markdown cache: s3://{bucket}/{md_key}")
+        
+        # Metadata 저장
+        json_key = f"{cache_prefix}/{cache_key}.json"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=json_key,
+            Body=json.dumps(metadata, ensure_ascii=False).encode('utf-8'),
+            ContentType='application/json'
+        )
+        logger.info(f"Saved metadata cache: s3://{bucket}/{json_key}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to save Docpamin cache: {e}")
+        return False
+
+
+def load_docpamin_cache_from_s3(
+    bucket: str,
+    prefix: str,
+    cache_key: str
+) -> Tuple[Optional[str], Optional[Dict]]:
+    """
+    S3에서 Docpamin 캐시 로드
+    
+    Returns:
+        (markdown, metadata) 또는 (None, None)
+    """
+    try:
+        cache_prefix = f"{prefix.rstrip('/')}/cache"
+        
+        # Markdown 로드
+        md_key = f"{cache_prefix}/{cache_key}.md"
+        logger.info(f"Checking cache: s3://{bucket}/{md_key}")
+        
+        md_response = s3_client.get_object(Bucket=bucket, Key=md_key)
+        markdown = md_response['Body'].read().decode('utf-8')
+        
+        # Metadata 로드
+        json_key = f"{cache_prefix}/{cache_key}.json"
+        json_response = s3_client.get_object(Bucket=bucket, Key=json_key)
+        metadata = json.loads(json_response['Body'].read().decode('utf-8'))
+        
+        logger.info(f"✅ Loaded from cache: {cache_key} (md_len={len(markdown)})")
+        return markdown, metadata
+        
+    except s3_client.exceptions.NoSuchKey:
+        logger.info(f"Cache not found: {cache_key}")
+        return None, None
+    except Exception as e:
+        logger.error(f"Failed to load cache: {e}")
+        return None, None
+
+
+
 def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
     logger.info(f"Parsing via Docpamin: {pdf_path}")
     headers = {"Authorization": f"Bearer {DOCPAMIN_API_KEY}"}
@@ -409,18 +411,51 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
     except Exception as e:
         logger.error(f"Docpamin error: {e}")
         raise
-
 def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, Dict]:
     """
-    URL을 사용하여 Docpamin으로 PDF 파싱
-    
-    Args:
-        pdf_url: PDF URL
-        arxiv_id: arXiv ID (임시 제목용)
-    
-    Returns:
-        (markdown, metadata)
+    URL로 PDF 파싱 (캐싱 지원)
     """
+    # 캐시 키 생성
+    cache_key = get_docpamin_cache_key(arxiv_id or pdf_url)
+    
+    # 캐시 확인 (S3에서)
+    # prefix는 환경변수나 컨텍스트에서 가져와야 함
+    # 여기서는 간단히 하드코딩 (실제로는 함수 인자로 받아야 함)
+    bucket = S3_BUCKET
+    prefix = S3_PAPERS_PREFIX  # 이 부분은 호출 시점에서 전달받아야 함
+    
+    cached_md, cached_meta = load_docpamin_cache_from_s3(bucket, prefix, cache_key)
+    
+    if cached_md and cached_meta:
+        logger.info(f"📦 Using cached Docpamin result for {cache_key}")
+        
+        # 제목 추출
+        paper_title = extract_title_from_markdown(cached_md)
+        cached_meta['extracted_title'] = paper_title
+        cached_meta['from_cache'] = True
+        
+        # 이미지 전처리
+        md_cleaned, extracted_images = process_markdown_images(
+            cached_md,
+            remove_for_llm=True,
+            keep_representative=1
+        )
+        
+        if extracted_images:
+            representative = select_representative_images(
+                extracted_images,
+                max_count=1,
+                paper_title=paper_title
+            )
+            
+            cached_meta['images_info'] = {
+                'total_images': len(extracted_images),
+                'representative_images': representative
+            }
+        
+        return md_cleaned, cached_meta
+    
+    # 캐시 없음 → Docpamin 파싱
     logger.info(f"Parsing via Docpamin (URL): {pdf_url}")
     headers = {"Authorization": f"Bearer {DOCPAMIN_API_KEY}"}
     session = requests.Session()
@@ -438,9 +473,9 @@ def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, 
         }
         
         r = session.post(
-            f"{DOCPAMIN_BASE_URL}/tasks", 
+            f"{DOCPAMIN_BASE_URL}/tasks",
             data=data,
-            verify=DOCPAMIN_CRT_FILE, 
+            verify=DOCPAMIN_CRT_FILE,
             timeout=REQ_TIMEOUT
         )
         r.raise_for_status()
@@ -455,7 +490,7 @@ def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, 
         while waited < max_wait:
             s = session.get(
                 f"{DOCPAMIN_BASE_URL}/tasks/{task_id}",
-                verify=DOCPAMIN_CRT_FILE, 
+                verify=DOCPAMIN_CRT_FILE,
                 timeout=REQ_TIMEOUT
             )
             s.raise_for_status()
@@ -474,9 +509,9 @@ def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, 
         # Export
         opts = {"task_ids": [task_id], "output_types": ["markdown", "json"]}
         e = session.post(
-            f"{DOCPAMIN_BASE_URL}/tasks/export", 
+            f"{DOCPAMIN_BASE_URL}/tasks/export",
             json=opts,
-            verify=DOCPAMIN_CRT_FILE, 
+            verify=DOCPAMIN_CRT_FILE,
             timeout=REQ_TIMEOUT
         )
         e.raise_for_status()
@@ -498,21 +533,25 @@ def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, 
         if not md:
             raise Exception("Docpamin: no markdown in export")
         
+        # 캐시 저장
+        save_docpamin_cache_to_s3(bucket, prefix, cache_key, md, meta)
+        
+        # 나머지 처리 (기존과 동일)
         paper_title = extract_title_from_markdown(md)
         meta['extracted_title'] = paper_title
+        meta['from_cache'] = False
         
         logger.info(f"Docpamin parsed OK (md_len={len(md)}, title={paper_title})")
         
-        # 이미지 전처리
         md_cleaned, extracted_images = process_markdown_images(
-            md, 
+            md,
             remove_for_llm=True,
             keep_representative=1
         )
         
         if extracted_images:
             representative = select_representative_images(
-                extracted_images, 
+                extracted_images,
                 max_count=1,
                 paper_title=paper_title
             )
@@ -521,7 +560,7 @@ def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, 
                 'total_images': len(extracted_images),
                 'representative_images': representative
             }
-            logger.info(f"Image preprocessing: {len(extracted_images)} total, selected Figure {representative[0]['index']+1}")
+            logger.info(f"Image preprocessing: {len(extracted_images)} total")
         
         return md_cleaned, meta
         
@@ -578,6 +617,105 @@ def extract_title_from_markdown(markdown: str) -> str:
         logger.error(f"Error extracting title: {e}")
         return "Unknown"
 
+
+# ===== Image Preprocessing Functions =====
+
+def remove_base64_images(markdown: str, replacement: str = "[Image]") -> Tuple[str, int]:
+    """
+    Base64 이미지를 플레이스홀더로 대체
+    
+    Returns:
+        (cleaned_markdown, num_removed)
+    """
+    pattern = r'!\[([^\]]*)\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=]+\)'
+    cleaned, count = re.subn(pattern, replacement, markdown)
+    if count > 0:
+        logger.info(f"Removed {count} base64 images from markdown")
+    return cleaned, count
+
+def extract_base64_images(markdown: str) -> List[Dict]:
+    """Markdown에서 base64 이미지 추출"""
+    pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([A-Za-z0-9+/=]+)\)'
+    images = []
+    for match in re.finditer(pattern, markdown):
+        base64_data = match.group(3)
+        size_bytes = len(base64_data) * 3 // 4
+        images.append({
+            'full_match': match.group(0),
+            'alt_text': match.group(1),
+            'mime_type': match.group(2),
+            'base64_data': base64_data,
+            'size_kb': size_bytes / 1024,
+            'position': match.start()
+        })
+    return images
+
+def extract_figure_caption(markdown: str, figure_index: int, max_length: int = 150) -> str:
+    """
+    Markdown에서 Figure caption 추출 (LaTeX 스타일 지원)
+    """
+    try:
+        fig_num = figure_index + 1
+        
+        logger.debug(f"Searching caption for Figure {fig_num}")
+        
+        # 패턴 개선 (LaTeX 스타일 포함)
+        patterns = [
+            # "Figure~1:" (LaTeX non-breaking space)
+            rf'(?:^|\n)Figure~{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
+            # "Figure 1:" or "Figure  1:" (공백 1개 이상)
+            rf'(?:^|\n)Figure\s+{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
+            # "Fig. 1:" or "Fig~1:"
+            rf'(?:^|\n)Fig\.?~?{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
+            # "**Figure 1:**"
+            rf'\*\*Figure\s*~?\s*{fig_num}\*\*[:\.]?\s*([^\n]+?)(?:\n|$)',
+            # "Figure 1 -" or "Figure~1 -"
+            rf'(?:^|\n)Figure\s*~?\s*{fig_num}\s*[-–—]\s*([^\n]+?)(?:\n|$)',
+        ]
+        
+        for i, pattern in enumerate(patterns):
+            match = re.search(pattern, markdown, re.IGNORECASE | re.MULTILINE)
+            if match:
+                caption = match.group(1).strip()
+                
+                # 유효성 검사
+                if len(caption) < 10:
+                    logger.debug(f"  Pattern {i}: Too short ('{caption}')")
+                    continue
+                
+                if caption.startswith('![') or caption.startswith(']('):
+                    logger.debug(f"  Pattern {i}: Image markdown")
+                    continue
+                
+                # 이상한 번호 제거 "0: Comparison..."
+                if re.match(r'^\d+:', caption):
+                    caption = re.sub(r'^\d+:\s*', '', caption)
+                
+                # 길이 제한
+                if len(caption) > max_length:
+                    # 단어 경계에서 자르기
+                    caption = caption[:max_length].rsplit(' ', 1)[0] + '...'
+                
+                logger.info(f"✅ Found caption for Figure {fig_num}: '{caption}'")
+                return caption
+        
+        logger.debug(f"❌ No caption found for Figure {fig_num}")
+        return ""
+        
+    except Exception as e:
+        logger.error(f"Error extracting caption: {e}")
+        return ""
+
+def select_representative_image(images: List[Dict], min_kb: float = 10, max_kb: float = 200) -> Optional[Dict]:
+    """대표 이미지 선정 (크기 + 위치 기준)"""
+    if not images:
+        return None
+    candidates = [img for img in images if min_kb <= img['size_kb'] <= max_kb]
+    if not candidates:
+        candidates = sorted(images, key=lambda x: abs(x['size_kb'] - (min_kb + max_kb) / 2))[:3]
+    return min(candidates, key=lambda x: x['position']) if candidates else None
+
+
 # ===== Image Processing =====
 def process_markdown_images(
     markdown: str, 
@@ -631,10 +769,10 @@ def process_markdown_images(
         logger.info(f"Processed {len(images)} images. Total: {total_img_size:,} chars")
     
     return processed_md, images
-
 def select_representative_image_with_llm(images: List[Dict], paper_title: str = "") -> Dict:
     """
-    LLM을 사용하여 가장 대표적인 이미지 선택 (Caption 포함)
+    LLM을 사용하여 가장 대표적인 이미지 선택
+    Caption 있는 것만 고려, 선택 번호로 매칭
     """
     if not images:
         return None
@@ -643,82 +781,107 @@ def select_representative_image_with_llm(images: List[Dict], paper_title: str = 
         return images[0]
     
     try:
-        # 이미지 정보 포맷 (Caption 우선 사용)
-        image_descriptions = []
+        # STEP 1: Caption 있는 이미지만 필터링
+        images_with_caption = []
         for img in images:
-            desc = f"Figure {img['index'] + 1}"
+            has_caption = bool(img.get('caption') and len(img['caption']) > 10)
+            has_alt = bool(img.get('alt') and img['alt'] not in ['Image', ''] and len(img['alt']) > 10)
             
-            # Caption 우선 (markdown에서 추출)
-            if img.get('caption'):
-                desc += f": {img['caption']}"
-            elif img.get('alt') and img['alt'] != 'Image':
-                desc += f": {img['alt']}"
-            
-            desc += f" (Size: {img['size_kb']:.1f}KB)"
-            image_descriptions.append(desc)
+            if has_caption or has_alt:
+                images_with_caption.append(img)
         
-        # 프롬프트
+        logger.info(f"Filtered: {len(images_with_caption)}/{len(images)} images have captions")
+        
+        # Caption 없으면 fallback
+        if not images_with_caption:
+            logger.warning("No images with captions, using first image")
+            return images[0]
+        
+        # Caption 1개면 바로 선택
+        if len(images_with_caption) == 1:
+            logger.info(f"Only one captioned image: Index {images_with_caption[0]['index']}")
+            return images_with_caption[0]
+        
+        # STEP 2: 선택 번호 기반 목록 생성 (중요!)
+        image_descriptions = []
+        for choice_num, img in enumerate(images_with_caption, 1):  # ← choice_num: 1, 2, 3...
+            fig_num = img['index'] + 1  # 실제 Figure 번호 (정보용)
+            caption = img.get('caption') or img.get('alt', '')
+            
+            # 선택 번호를 사용 (논문 Figure 번호 아님!)
+            desc = f"{choice_num}. (Figure {fig_num} in paper): {caption} (Size: {img['size_kb']:.1f}KB)"
+            image_descriptions.append(desc)
+            logger.debug(f"  Choice {choice_num}: Index {img['index']} - {caption[:50]}...")
+        
+        # STEP 3: LLM 프롬프트 (선택 번호 명확히)
         prompt = f"""You are analyzing a research paper titled: "{paper_title}"
 
-Below is a list of figures from this paper. Select the ONE figure that best represents the main contribution or overview of the paper. 
+Below is a list of figures from this paper that have captions. Select the ONE figure that best represents the main contribution or overview.
 
-Prioritize figures that show (Important): 
-1. Overall architecture/framework diagrams
-2. System overview illustrations 
-3. Main workflow diagrams
+**Selection Criteria (in order of importance):**
 
-Avoid selecting:
-- Detailed experimental result graphs or tables
-- Comparison tables
-- Ablation study charts
-- Small component diagrams
+1. **Caption Keywords** (MOST IMPORTANT):
+   - Look for: "Overview", "Architecture", "Framework", "System", "Workflow", "Proposed"
+   - Avoid: "Comparison", "Results", "Ablation", "Performance", "Experiment"
 
-Consider:
-- Representative figure's caption usually include keywords such as **"Architecture," "Overview,"** or **"main workflow."**
-- Image size is the least opponent that you should consider.
+2. **Figure Size**: LEAST important
 
-Figures:
-{chr(10).join(f"{i+1}. {desc}" for i, desc in enumerate(image_descriptions))}
+**Figures with captions:**
+{chr(10).join(image_descriptions)}
 
-Respond with ONLY the number (1-{len(images)}) of the best representative figure. No explanation needed."""
+**Instructions:**
+- Respond with ONLY the choice number (1-{len(images_with_caption)})
+- For example, if you choose the first option, respond: "1"
+- Do NOT respond with the figure number from the paper
+- Do NOT include any explanation"""
 
-        # call_llm 사용
+        # LLM 호출
         messages = [{"role": "user", "content": prompt}]
-        response = call_llm(messages, max_tokens=1000)
+        response = call_llm(messages, max_tokens=250)
+        
+        if not response or not response.strip():
+            logger.warning("Empty LLM response, using first captioned image")
+            return images_with_caption[0]
+        
+        response_text = response.strip()
+        logger.info(f"LLM raw response: '{response_text}'")
         
         # 숫자 추출
-        response_text = response.strip()
-        numbers = re.findall(r'\d+', response_text)
+        numbers = re.findall(r'\b(\d+)\b', response_text)
         
         if not numbers:
-            raise ValueError(f"No number found in LLM response: {response_text}")
+            logger.warning(f"No number in response, using first captioned image")
+            return images_with_caption[0]
         
-        selected_num = int(numbers[0])
-        selected_idx = selected_num - 1
+        # STEP 4: 선택 번호로 매칭
+        choice_num = int(numbers[0])
+        choice_idx = choice_num - 1  # 0-based 인덱스
         
-        if 0 <= selected_idx < len(images):
-            logger.info(f"LLM selected Figure {selected_num} as representative image (from response: '{response_text}')")
-            return images[selected_idx]
+        logger.info(f"LLM chose: Choice {choice_num} (0-based index: {choice_idx})")
+        
+        # 범위 검증
+        if 0 <= choice_idx < len(images_with_caption):
+            selected_img = images_with_caption[choice_idx]
+            
+            caption_preview = selected_img.get('caption', 'N/A')[:60]
+            logger.info(f"✅ Selected: Index {selected_img['index']} (Figure {selected_img['index']+1} in paper)")
+            logger.info(f"   Caption: {caption_preview}...")
+            logger.info(f"   Size: {selected_img['size_kb']:.1f}KB")
+            
+            return selected_img
         else:
-            logger.warning(f"LLM returned invalid index: {selected_num} (valid: 1-{len(images)}), using largest")
-            return max(images, key=lambda x: x['size_kb'])
+            logger.warning(f"Choice {choice_num} out of range (1-{len(images_with_caption)}), using first")
+            return images_with_caption[0]
             
     except Exception as e:
-        logger.error(f"LLM image selection failed: {e}, falling back to size-based")
-        return max(images, key=lambda x: x['size_kb'])
+        logger.error(f"LLM selection failed: {type(e).__name__}: {e}")
+        logger.exception("Full traceback:")
+        return images[0] if images else None
 
 
 def select_representative_images(images: List[Dict], max_count: int = 1, paper_title: str = "") -> List[Dict]:
     """
-    논문의 대표 이미지 선택 (LLM 기반)
-    
-    Args:
-        images: 이미지 리스트
-        max_count: 최대 선택 개수 (현재는 1개만)
-        paper_title: 논문 제목
-    
-    Returns:
-        선택된 이미지 리스트
+    논문의 대표 이미지 선택 (Caption 있는 것만 고려)
     """
     if not images:
         return []
@@ -726,10 +889,9 @@ def select_representative_images(images: List[Dict], max_count: int = 1, paper_t
     if len(images) <= max_count:
         return images[:max_count]
     
-    # LLM으로 대표 이미지 선택
+    # LLM으로 대표 이미지 선택 (내부에서 caption 필터링)
     selected = select_representative_image_with_llm(images, paper_title)
     return [selected] if selected else []
-
 
 # ===== LLM utils =====
 def _estimate_tokens(s: str) -> int:
@@ -1373,7 +1535,7 @@ Source prefix: `{prefix}`
         if a.abstract and a.abstract.strip():
             abstract_block = f"\n**Abstract**\n\n> {a.abstract.strip()}\n\n"
         
-        # ⭐ Summary JSON 파싱 및 개조식 변환
+        # Summary JSON 파싱 및 개조식 변환
         summary_formatted = format_summary_as_markdown(a.summary)
         
         sec = f"""## {i}. {a.title}
@@ -1916,6 +2078,43 @@ async def debug_summarize_sections(req: DebugSummarizeSectionsRequest):
         "improvements_used": {
             "overlap": req.use_overlap
         }
+    }
+
+@app.post("/debug/test-caption-extraction")
+async def debug_test_caption_extraction(
+    markdown: str = Form(...),
+    figure_count: int = Form(5)
+):
+    """
+    Caption 추출 테스트
+    """
+    results = []
+    
+    for i in range(figure_count):
+        caption = extract_figure_caption(markdown, i, max_length=200)
+        results.append({
+            "figure_index": i,
+            "figure_number": i + 1,
+            "caption": caption,
+            "found": bool(caption)
+        })
+    
+    # 이미지도 추출
+    _, images = process_markdown_images(markdown, remove_for_llm=False)
+    
+    return {
+        "total_images": len(images),
+        "captions_found": sum(1 for r in results if r['found']),
+        "caption_results": results,
+        "images_info": [
+            {
+                "index": img['index'],
+                "size_kb": img['size_kb'],
+                "alt": img.get('alt', ''),
+                "caption": img.get('caption', '')
+            }
+            for img in images
+        ]
     }
 
 if __name__ == "__main__":
