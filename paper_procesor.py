@@ -232,8 +232,23 @@ def download_pdf_from_s3(s3_key: str, s3_bucket: str) -> str:
         raise Exception(f"Failed to download PDF: {e}")
 
 # ===== Docpamin =====
-
-
+def get_docpamin_cache_key(source_identifier: str) -> str:
+    """
+    캐시 키 생성 (arXiv ID 또는 파일 해시)
+    
+    Args:
+        source_identifier: arXiv ID (예: 2510.11701) 또는 S3 key
+    
+    Returns:
+        캐시 키 (예: "2510.11701" 또는 MD5 해시)
+    """
+    # arXiv ID 추출
+    arxiv_match = re.search(r'(\d{4}\.\d{5})', source_identifier)
+    if arxiv_match:
+        return arxiv_match.group(1)
+    
+    # 일반 파일명에서 해시 생성
+    return hashlib.md5(source_identifier.encode()).hexdigest()[:16]
 
 def save_docpamin_cache_to_s3(
     bucket: str,
@@ -411,6 +426,7 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
     except Exception as e:
         logger.error(f"Docpamin error: {e}")
         raise
+
 def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, Dict]:
     """
     URL로 PDF 파싱 (캐싱 지원)
@@ -649,62 +665,126 @@ def extract_base64_images(markdown: str) -> List[Dict]:
             'position': match.start()
         })
     return images
+    
+def extract_all_figure_captions(markdown: str) -> Dict[int, str]:
+    """
+    Markdown에서 모든 Figure caption 추출
+    
+    Returns:
+        {figure_number: caption} 딕셔너리
+    """
+    captions = {}
+    
+    # 모든 Figure caption 패턴
+    patterns = [
+        r'Figure~(\d+)[:\.]?\s*([^\n]+)',
+        r'Figure\s+(\d+)[:\.]?\s*([^\n]+)',
+        r'Fig\.?~?(\d+)[:\.]?\s*([^\n]+)',
+        r'\*\*Figure\s*~?\s*(\d+)\*\*[:\.]?\s*([^\n]+)',
+    ]
+    
+    for pattern in patterns:
+        for match in re.finditer(pattern, markdown, re.IGNORECASE | re.MULTILINE):
+            fig_num = int(match.group(1))
+            caption = match.group(2).strip()
+            
+            # 유효성 검사
+            if len(caption) < 10:
+                continue
+            if caption.startswith('![') or caption.startswith(']('):
+                continue
+            
+            # 이상한 번호 제거
+            caption = re.sub(r'^\d+:\s*', '', caption)
+            
+            # 길이 제한
+            if len(caption) > 150:
+                caption = caption[:150].rsplit(' ', 1)[0] + '...'
+            
+            # 아직 없거나 더 긴 caption이면 업데이트
+            if fig_num not in captions or len(caption) > len(captions[fig_num]):
+                captions[fig_num] = caption
+                logger.debug(f"Found Figure {fig_num}: {caption[:60]}...")
+    
+    logger.info(f"Extracted {len(captions)} figure captions: {list(captions.keys())}")
+    return captions
 
-def extract_figure_caption(markdown: str, figure_index: int, max_length: int = 150) -> str:
+
+def match_images_with_captions(
+    images: List[Dict],
+    markdown: str
+) -> List[Dict]:
     """
-    Markdown에서 Figure caption 추출 (LaTeX 스타일 지원)
+    이미지와 Figure caption 매칭
+    
+    Strategy:
+    1. Markdown에서 모든 이미지와 caption의 위치 파악
+    2. 각 이미지 바로 뒤에 나오는 caption 찾기
+    3. 또는 이미지와 가장 가까운 caption 매칭
     """
-    try:
-        fig_num = figure_index + 1
+    # 모든 Figure caption 추출
+    all_captions = extract_all_figure_captions(markdown)
+    
+    if not all_captions:
+        logger.warning("No figure captions found in markdown")
+        return images
+    
+    # 이미지 패턴으로 markdown 내 위치 찾기
+    img_pattern = r'!\[.*?\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=]+\)'
+    
+    # Caption 패턴으로 위치 찾기
+    caption_pattern = r'Figure[~\s]+(\d+)[:\.]?'
+    
+    # 이미지 위치들
+    img_positions = []
+    for match in re.finditer(img_pattern, markdown):
+        img_positions.append({
+            'start': match.start(),
+            'end': match.end()
+        })
+    
+    # Caption 위치들 (Figure 번호와 함께)
+    caption_positions = []
+    for match in re.finditer(caption_pattern, markdown, re.IGNORECASE):
+        fig_num = int(match.group(1))
+        if fig_num in all_captions:
+            caption_positions.append({
+                'fig_num': fig_num,
+                'position': match.start(),
+                'caption': all_captions[fig_num]
+            })
+    
+    logger.info(f"Found {len(img_positions)} images and {len(caption_positions)} caption positions")
+    
+    # 각 이미지와 가장 가까운 caption 매칭
+    for i, img in enumerate(images):
+        if i >= len(img_positions):
+            break
         
-        logger.debug(f"Searching caption for Figure {fig_num}")
+        img_end = img_positions[i]['end']
         
-        # 패턴 개선 (LaTeX 스타일 포함)
-        patterns = [
-            # "Figure~1:" (LaTeX non-breaking space)
-            rf'(?:^|\n)Figure~{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
-            # "Figure 1:" or "Figure  1:" (공백 1개 이상)
-            rf'(?:^|\n)Figure\s+{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
-            # "Fig. 1:" or "Fig~1:"
-            rf'(?:^|\n)Fig\.?~?{fig_num}[:\.]?\s*([^\n]+?)(?:\n|$)',
-            # "**Figure 1:**"
-            rf'\*\*Figure\s*~?\s*{fig_num}\*\*[:\.]?\s*([^\n]+?)(?:\n|$)',
-            # "Figure 1 -" or "Figure~1 -"
-            rf'(?:^|\n)Figure\s*~?\s*{fig_num}\s*[-–—]\s*([^\n]+?)(?:\n|$)',
-        ]
+        # 이미지 뒤에 나오는 caption 중 가장 가까운 것
+        closest_caption = None
+        min_distance = float('inf')
         
-        for i, pattern in enumerate(patterns):
-            match = re.search(pattern, markdown, re.IGNORECASE | re.MULTILINE)
-            if match:
-                caption = match.group(1).strip()
-                
-                # 유효성 검사
-                if len(caption) < 10:
-                    logger.debug(f"  Pattern {i}: Too short ('{caption}')")
-                    continue
-                
-                if caption.startswith('![') or caption.startswith(']('):
-                    logger.debug(f"  Pattern {i}: Image markdown")
-                    continue
-                
-                # 이상한 번호 제거 "0: Comparison..."
-                if re.match(r'^\d+:', caption):
-                    caption = re.sub(r'^\d+:\s*', '', caption)
-                
-                # 길이 제한
-                if len(caption) > max_length:
-                    # 단어 경계에서 자르기
-                    caption = caption[:max_length].rsplit(' ', 1)[0] + '...'
-                
-                logger.info(f"✅ Found caption for Figure {fig_num}: '{caption}'")
-                return caption
+        for cap_info in caption_positions:
+            # Caption이 이미지 뒤에 있고
+            if cap_info['position'] > img_end:
+                distance = cap_info['position'] - img_end
+                # 너무 멀지 않으면 (1000자 이내)
+                if distance < min_distance and distance < 1000:
+                    min_distance = distance
+                    closest_caption = cap_info
         
-        logger.debug(f"❌ No caption found for Figure {fig_num}")
-        return ""
-        
-    except Exception as e:
-        logger.error(f"Error extracting caption: {e}")
-        return ""
+        if closest_caption:
+            img['caption'] = closest_caption['caption']
+            img['figure_number'] = closest_caption['fig_num']
+            logger.info(f"✅ Matched image {i} → Figure {closest_caption['fig_num']}: {closest_caption['caption'][:50]}...")
+        else:
+            logger.debug(f"No caption matched for image {i}")
+    
+    return images
+
 
 def select_representative_image(images: List[Dict], min_kb: float = 10, max_kb: float = 200) -> Optional[Dict]:
     """대표 이미지 선정 (크기 + 위치 기준)"""
@@ -723,7 +803,7 @@ def process_markdown_images(
     keep_representative: int = 1
 ) -> Tuple[str, List[Dict]]:
     """
-    Markdown에서 이미지 처리 + Caption 추출
+    Markdown에서 이미지 처리 + Caption 매칭 (개선)
     """
     pattern = r'!\[(.*?)\]\(data:image/([^;]+);base64,([A-Za-z0-9+/=]+)\)'
     
@@ -749,30 +829,30 @@ def process_markdown_images(
         
         if remove_for_llm:
             if alt_text.strip():
-                return f"\n[Figure {len(images)}: {alt_text}]\n"
+                return f"\n[Image {len(images)}: {alt_text}]\n"
             else:
-                return f"\n[Figure {len(images)}]\n"
+                return f"\n[Image {len(images)}]\n"
         else:
             return full_img
     
     # 이미지 추출
     processed_md = re.sub(pattern, extract_image, markdown)
     
-    # Caption 추출 (원본 markdown 사용)
+    # ⭐ Caption 매칭 (개선된 방식)
     if images:
-        for img in images:
-            caption = extract_figure_caption(markdown, img['index'])
-            if caption:
-                img['caption'] = caption
+        images = match_images_with_captions(images, markdown)
         
         total_img_size = sum(img['size'] for img in images)
-        logger.info(f"Processed {len(images)} images. Total: {total_img_size:,} chars")
+        captions_found = sum(1 for img in images if img.get('caption'))
+        
+        logger.info(f"Processed {len(images)} images ({captions_found} with captions)")
+        logger.info(f"Total size: {total_img_size:,} chars")
     
     return processed_md, images
+
 def select_representative_image_with_llm(images: List[Dict], paper_title: str = "") -> Dict:
     """
     LLM을 사용하여 가장 대표적인 이미지 선택
-    Caption 있는 것만 고려, 선택 번호로 매칭
     """
     if not images:
         return None
@@ -781,7 +861,17 @@ def select_representative_image_with_llm(images: List[Dict], paper_title: str = 
         return images[0]
     
     try:
-        # STEP 1: Caption 있는 이미지만 필터링
+        # ⭐ 입력 디버깅
+        logger.info("=" * 60)
+        logger.info("🎯 select_representative_image_with_llm called")
+        logger.info(f"Total images: {len(images)}")
+        for i, img in enumerate(images):
+            logger.info(f"  Image {i}: index={img['index']}, "
+                       f"figure_num={img.get('figure_number', 'N/A')}, "
+                       f"caption={img.get('caption', 'N/A')[:40]}...")
+        logger.info("=" * 60)
+        
+        # Caption 필터링
         images_with_caption = []
         for img in images:
             has_caption = bool(img.get('caption') and len(img['caption']) > 10)
@@ -792,28 +882,26 @@ def select_representative_image_with_llm(images: List[Dict], paper_title: str = 
         
         logger.info(f"Filtered: {len(images_with_caption)}/{len(images)} images have captions")
         
-        # Caption 없으면 fallback
         if not images_with_caption:
-            logger.warning("No images with captions, using first image")
+            logger.warning("No captions found, using first image")
+            logger.info(f"Returning: index={images[0]['index']}")
             return images[0]
         
-        # Caption 1개면 바로 선택
         if len(images_with_caption) == 1:
-            logger.info(f"Only one captioned image: Index {images_with_caption[0]['index']}")
+            logger.info(f"Only one captioned image: index={images_with_caption[0]['index']}")
             return images_with_caption[0]
         
-        # STEP 2: 선택 번호 기반 목록 생성 (중요!)
+        # 선택지 생성
         image_descriptions = []
-        for choice_num, img in enumerate(images_with_caption, 1):  # ← choice_num: 1, 2, 3...
-            fig_num = img['index'] + 1  # 실제 Figure 번호 (정보용)
+        for choice_num, img in enumerate(images_with_caption, 1):
+            fig_num = img.get('figure_number', img['index'] + 1)
             caption = img.get('caption') or img.get('alt', '')
             
-            # 선택 번호를 사용 (논문 Figure 번호 아님!)
             desc = f"{choice_num}. (Figure {fig_num} in paper): {caption} (Size: {img['size_kb']:.1f}KB)"
             image_descriptions.append(desc)
-            logger.debug(f"  Choice {choice_num}: Index {img['index']} - {caption[:50]}...")
+            logger.debug(f"  Choice {choice_num}: index={img['index']}, fig={fig_num}")
         
-        # STEP 3: LLM 프롬프트 (선택 번호 명확히)
+        # LLM 호출
         prompt = f"""You are analyzing a research paper titled: "{paper_title}"
 
 Below is a list of figures from this paper that have captions. Select the ONE figure that best represents the main contribution or overview.
@@ -822,7 +910,7 @@ Below is a list of figures from this paper that have captions. Select the ONE fi
 
 1. **Caption Keywords** (MOST IMPORTANT):
    - Look for: "Overview", "Architecture", "Framework", "System", "Workflow", "Proposed"
-   - Avoid: "Comparison", "Results", "Ablation", "Performance", "Experiment"
+   - Avoid: "Results", "Comparison", "Ablation", "Performance", "Experiment"
 
 2. **Figure Size**: LEAST important
 
@@ -831,50 +919,48 @@ Below is a list of figures from this paper that have captions. Select the ONE fi
 
 **Instructions:**
 - Respond with ONLY the choice number (1-{len(images_with_caption)})
-- For example, if you choose the first option, respond: "1"
-- Do NOT respond with the figure number from the paper
 - Do NOT include any explanation"""
 
-        # LLM 호출
         messages = [{"role": "user", "content": prompt}]
         response = call_llm(messages, max_tokens=250)
         
-        if not response or not response.strip():
-            logger.warning("Empty LLM response, using first captioned image")
-            return images_with_caption[0]
-        
         response_text = response.strip()
-        logger.info(f"LLM raw response: '{response_text}'")
+        logger.info(f"LLM response: '{response_text}'")
         
         # 숫자 추출
         numbers = re.findall(r'\b(\d+)\b', response_text)
         
         if not numbers:
-            logger.warning(f"No number in response, using first captioned image")
-            return images_with_caption[0]
+            logger.warning("No number in response, using first captioned")
+            selected = images_with_caption[0]
+            logger.info(f"Returning: index={selected['index']}")
+            return selected
         
-        # STEP 4: 선택 번호로 매칭
         choice_num = int(numbers[0])
-        choice_idx = choice_num - 1  # 0-based 인덱스
+        choice_idx = choice_num - 1
         
-        logger.info(f"LLM chose: Choice {choice_num} (0-based index: {choice_idx})")
+        logger.info(f"LLM chose: choice={choice_num}, idx={choice_idx}")
         
-        # 범위 검증
         if 0 <= choice_idx < len(images_with_caption):
             selected_img = images_with_caption[choice_idx]
             
-            caption_preview = selected_img.get('caption', 'N/A')[:60]
-            logger.info(f"✅ Selected: Index {selected_img['index']} (Figure {selected_img['index']+1} in paper)")
-            logger.info(f"   Caption: {caption_preview}...")
+            logger.info("=" * 60)
+            logger.info(f"✅ SELECTED:")
+            logger.info(f"   Index: {selected_img['index']}")
+            logger.info(f"   Figure number: {selected_img.get('figure_number', 'N/A')}")
+            logger.info(f"   Caption: {selected_img.get('caption', 'N/A')[:60]}...")
             logger.info(f"   Size: {selected_img['size_kb']:.1f}KB")
+            logger.info("=" * 60)
             
             return selected_img
         else:
-            logger.warning(f"Choice {choice_num} out of range (1-{len(images_with_caption)}), using first")
-            return images_with_caption[0]
+            logger.warning(f"Choice {choice_num} out of range, using first")
+            selected = images_with_caption[0]
+            logger.info(f"Returning: index={selected['index']}")
+            return selected
             
     except Exception as e:
-        logger.error(f"LLM selection failed: {type(e).__name__}: {e}")
+        logger.error(f"Selection failed: {e}")
         logger.exception("Full traceback:")
         return images[0] if images else None
 
@@ -2078,43 +2164,6 @@ async def debug_summarize_sections(req: DebugSummarizeSectionsRequest):
         "improvements_used": {
             "overlap": req.use_overlap
         }
-    }
-
-@app.post("/debug/test-caption-extraction")
-async def debug_test_caption_extraction(
-    markdown: str = Form(...),
-    figure_count: int = Form(5)
-):
-    """
-    Caption 추출 테스트
-    """
-    results = []
-    
-    for i in range(figure_count):
-        caption = extract_figure_caption(markdown, i, max_length=200)
-        results.append({
-            "figure_index": i,
-            "figure_number": i + 1,
-            "caption": caption,
-            "found": bool(caption)
-        })
-    
-    # 이미지도 추출
-    _, images = process_markdown_images(markdown, remove_for_llm=False)
-    
-    return {
-        "total_images": len(images),
-        "captions_found": sum(1 for r in results if r['found']),
-        "caption_results": results,
-        "images_info": [
-            {
-                "index": img['index'],
-                "size_kb": img['size_kb'],
-                "alt": img.get('alt', ''),
-                "caption": img.get('caption', '')
-            }
-            for img in images
-        ]
     }
 
 if __name__ == "__main__":
