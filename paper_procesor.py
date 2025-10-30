@@ -1461,18 +1461,28 @@ def analyze_paper_with_llm_improved(
         "tags": [],
     }
     
-    final_prompt = f"""논문 "{paper_info.get('title','Unknown')}"의 {'계층적 ' if use_hierarchical else ''}요약이 아래에 있습니다:
+    final_prompt = f"""논문 "{paper_info.get('title','Unknown')}"의 섹션별 요약이 아래에 있습니다:
 
 {combined}
 
-아래 JSON 스키마에 맞게 결과만 JSON으로 출력하세요(설명문 금지):
+아래 JSON 스키마에 맞게 결과만 JSON으로 한글로 출력하세요(설명문 금지):
 {json.dumps(format_hint, ensure_ascii=False, indent=2)}
 
 규칙:
 - key_contributions: 3~6개 bullet 수준의 간결 문장
-- relevance_score: 1~10 정수
+- relevance_score: **LLM 에이전트 연구/개발에 대한 관련성** (1~10 정수)
+  * 1-3: 관련 없음 (전혀 다른 분야의 연구)
+  * 4-5: 간접 관련 (기초 기술이나 배경 지식)
+  * 6-7: 보통 관련 (참고할 만한 방법론이나 아이디어)
+  * 8-9: 높은 관련성 (직접 적용 가능한 기술이나 방법)
+  * 10: 필수 참고 (LLM 에이전트의 핵심 기술)
+
+    특히 다음 주제는 높은 점수:
+    - Agentic reasoning, tool use, planning
+    - Reinforcement learning for LLM agents
+    - Agent architectures, frameworks
+
 - tags: 5~8개 짧은 표제어 (영문)
-- 한글로 작성
 - 전문 용어는 English 그대로 유지
 """
     
