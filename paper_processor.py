@@ -246,16 +246,17 @@ async def process_s3_papers(request: S3PapersRequest):
 
         week_label = request.week_label or derive_week_label(prefix)
 
-        # GitHub용 markdown (이미지 포함)
+        # GitHub용 markdown (원본 크기 이미지 포함)
         md_filename, md_content = build_markdown(
             analyses, papers_metadata, week_label, prefix,
             save_images=True, include_images=True
         )
 
-        # 메일용 markdown (이미지 제외 - 크기 제한 때문)
+        # 메일용 markdown (리사이징된 이미지 포함 - 1MB 제한)
         _, md_content_email = build_markdown(
             analyses, papers_metadata, week_label, prefix,
-            save_images=False, include_images=False
+            save_images=False, include_images=True,
+            optimize_for_email=True, max_email_size_kb=950
         )
 
         confluence_result = None
