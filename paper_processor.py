@@ -273,8 +273,8 @@ async def process_s3_papers(request: S3PapersRequest):
             "prefix": prefix,
             "week_label": week_label,
             "md_filename": md_filename,
-            "md_content": md_content,
-            "md_content_email": md_content_email,  # 메일용 (이미지 없음)
+            "md_content": md_content,  # GitHub용 (원본 이미지, 파일 경로)
+            "md_content_email": md_content_email,  # 이메일용 (최적화된 JPEG 이미지, <1MB) ⚠️ n8n에서는 이 필드를 사용하세요!
             "papers_metadata": papers_metadata,
             "source": "url_list" if paper_urls else "pdf_files",
             "confluence_url": (confluence_result or {}).get("page_url"),
