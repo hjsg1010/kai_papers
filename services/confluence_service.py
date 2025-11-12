@@ -5,6 +5,8 @@ import logging
 import re
 import json
 import requests
+import base64
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
@@ -144,11 +146,73 @@ def derive_week_label(prefix: str) -> str:
     return f"w{iso_week}"
 
 
+def save_images_to_files(
+    papers_metadata: Optional[List[Dict]],
+    week_label: str,
+    output_dir: str = "images"
+) -> Dict[str, str]:
+    """
+    대표 이미지들을 파일로 저장
+
+    Args:
+        papers_metadata: 논문 메타데이터 리스트 (이미지 정보 포함)
+        week_label: 주차 레이블 (예: "w42")
+        output_dir: 이미지 저장 디렉토리
+
+    Returns:
+        Dict[s3_key, saved_filename]: 저장된 이미지 파일명 매핑
+    """
+    if not papers_metadata:
+        return {}
+
+    # 출력 디렉토리 생성
+    os.makedirs(output_dir, exist_ok=True)
+
+    saved_images = {}
+
+    for meta in papers_metadata:
+        images_info = meta.get('images_info', {})
+        rep_imgs = images_info.get('representative_images', [])
+
+        if not rep_imgs:
+            continue
+
+        rep_img = rep_imgs[0]
+        s3_key = meta.get('s3_key', '')
+
+        # base64 데이터가 있는지 확인
+        base64_data = rep_img.get('base64_data')
+        if not base64_data:
+            logger.warning(f"No base64 data for image in {s3_key}")
+            continue
+
+        # 파일명 생성
+        paper_name = Path(s3_key).stem
+        img_type = rep_img.get('type', 'png')
+        img_filename = f"{week_label}_{paper_name}_fig{rep_img['index'] + 1}.{img_type}"
+        img_path = os.path.join(output_dir, img_filename)
+
+        try:
+            # base64 디코딩 및 파일 저장
+            img_bytes = base64.b64decode(base64_data)
+            with open(img_path, 'wb') as f:
+                f.write(img_bytes)
+
+            saved_images[s3_key] = img_filename
+            logger.info(f"Saved image: {img_path} ({len(img_bytes)} bytes)")
+
+        except Exception as e:
+            logger.error(f"Failed to save image for {s3_key}: {e}")
+
+    return saved_images
+
+
 def build_markdown(
     analyses: List[PaperAnalysis],
     papers_metadata: Optional[List[Dict]] = None,
     week_label: str = "",
-    prefix: str = ""
+    prefix: str = "",
+    save_images: bool = True
 ) -> Tuple[str, str]:
     """
     논문 분석 결과를 Markdown으로 변환
@@ -158,12 +222,18 @@ def build_markdown(
         papers_metadata: 논문 메타데이터 리스트 (이미지 정보 포함)
         week_label: 주차 레이블 (예: "w42")
         prefix: S3 prefix
+        save_images: 이미지를 파일로 저장할지 여부
 
     Returns:
         Tuple[str, str]: (파일명, Markdown 콘텐츠)
     """
     if not week_label:
         week_label = derive_week_label(prefix)
+
+    # 이미지를 파일로 저장 (GitHub 표시용)
+    if save_images and papers_metadata:
+        saved_images = save_images_to_files(papers_metadata, week_label)
+        logger.info(f"Saved {len(saved_images)} images to files")
 
     header = f"""# AI Paper Newsletter – {week_label}
 _Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_
@@ -262,36 +332,34 @@ def format_summary_as_markdown(summary: str) -> str:
 
         # TL;DR
         if data.get('tldr'):
-            lines.append(f"**📌 TL;DR**\n")
+            lines.append(f"**📌 TL;DR**\n\n")
             lines.append(f"{data['tldr']}\n\n")
 
         # 핵심 기여
         if data.get('key_contributions'):
-            lines.append(f"**🎯 핵심 기여**\n")
-            for contrib in data['key_contributions']:
-                lines.append(f"- {contrib}\n")
+            lines.append(f"**🎯 핵심 기여**\n\n")
+            lines.append("".join([f"- {contrib}\n" for contrib in data['key_contributions']]))
             lines.append("\n")
 
         # 방법론
         if data.get('methodology'):
-            lines.append(f"**🔬 방법론**\n")
+            lines.append(f"**🔬 방법론**\n\n")
             lines.append(f"{data['methodology']}\n\n")
 
         # 결과
         if data.get('results'):
-            lines.append(f"**📊 결과**\n")
+            lines.append(f"**📊 결과**\n\n")
             lines.append(f"{data['results']}\n\n")
 
         # 새로운 점
         if data.get('novelty'):
-            lines.append(f"**💡 새로운 점**\n")
+            lines.append(f"**💡 새로운 점**\n\n")
             lines.append(f"{data['novelty']}\n\n")
 
         # 한계점
         if data.get('limitations'):
-            lines.append(f"**⚠️ 한계점**\n")
-            for limitation in data['limitations']:
-                lines.append(f"- {limitation}\n")
+            lines.append(f"**⚠️ 한계점**\n\n")
+            lines.append("".join([f"- {limitation}\n" for limitation in data['limitations']]))
             lines.append("\n")
 
         # Relevance Score
