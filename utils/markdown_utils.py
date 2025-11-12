@@ -99,7 +99,7 @@ def resize_image_base64(base64_data: str, max_width: int = 600, quality: int = 8
 def save_images_to_files(
     papers_metadata: Optional[List[Dict]],
     week_label: str,
-    output_dir: str = "images",
+    output_dir: str = "weekly_reports/images",
     create_thumbnails: bool = True
 ) -> Dict[str, str]:
     """
@@ -108,7 +108,7 @@ def save_images_to_files(
     Args:
         papers_metadata: 논문 메타데이터 리스트 (이미지 정보 포함)
         week_label: 주차 레이블 (예: "w42")
-        output_dir: 이미지 저장 디렉토리
+        output_dir: 이미지 저장 디렉토리 (기본값: weekly_reports/images)
         create_thumbnails: 썸네일 버전도 생성할지 여부 (메일용)
 
     Returns:
@@ -407,21 +407,25 @@ Source prefix: `{prefix}`
                 paper_name = Path(a.source_file).stem
                 img_filename = f"{week_label}_{paper_name}_fig{rep_img['index'] + 1}.{rep_img['type']}"
 
-                # 이메일용: base64 embedded 이미지 사용
+                # 이메일용: HTML img 태그로 직접 삽입 (마크다운 변환기 우회)
                 if optimize_for_email and rep_img.get('base64_data'):
-                    # JPEG 형식으로 가정 (resize_image_base64에서 JPEG로 변환함)
                     base64_data = rep_img['base64_data']
-                    image_src = f"data:image/jpeg;base64,{base64_data}"
-                else:
-                    # GitHub용: 파일 경로 사용
-                    image_src = f"images/{img_filename}"
-
-                sec += f"""### 📊 대표 이미지
+                    sec += f"""### 📊 대표 이미지
 
 **전체 이미지:** {img_info['total_images']}개
 **대표 이미지:** Figure {rep_img['index'] + 1} ({rep_img['size_kb']:.1f}KB)
 
-![Figure {rep_img['index'] + 1}]({image_src})
+<img src="data:image/jpeg;base64,{base64_data}" alt="Figure {rep_img['index'] + 1}" style="max-width: 100%; height: auto; margin: 20px 0;" />
+
+"""
+                else:
+                    # GitHub용: 파일 경로 사용
+                    sec += f"""### 📊 대표 이미지
+
+**전체 이미지:** {img_info['total_images']}개
+**대표 이미지:** Figure {rep_img['index'] + 1} ({rep_img['size_kb']:.1f}KB)
+
+![Figure {rep_img['index'] + 1}](images/{img_filename})
 
 """
 

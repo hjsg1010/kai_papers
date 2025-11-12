@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import logging
 import os
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import from newly created modules
@@ -259,6 +260,25 @@ async def process_s3_papers(request: S3PapersRequest):
             optimize_for_email=True, max_email_size_kb=950
         )
 
+        # 저장된 이미지 파일 목록 수집 (GitHub 푸시용)
+        image_files = []
+        images_dir = "weekly_reports/images"
+        if os.path.exists(images_dir):
+            for filename in os.listdir(images_dir):
+                # 현재 week_label에 해당하는 이미지만 수집 (썸네일 제외)
+                if filename.startswith(f"{week_label}_") and not filename.endswith("_thumb.jpg"):
+                    file_path = os.path.join(images_dir, filename)
+                    try:
+                        with open(file_path, 'rb') as f:
+                            file_content = base64.b64encode(f.read()).decode('utf-8')
+                        # weekly_reports/ 제거하고 상대 경로로
+                        image_files.append({
+                            "path": f"images/{filename}",
+                            "content": file_content
+                        })
+                    except Exception as e:
+                        logger.error(f"Failed to read image file {file_path}: {e}")
+
         confluence_result = None
         if request.upload_confluence and analyses:
             page_title = f"AI Paper Newsletter - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
@@ -275,6 +295,7 @@ async def process_s3_papers(request: S3PapersRequest):
             "md_filename": md_filename,
             "md_content": md_content,  # GitHub용 (원본 이미지, 파일 경로)
             "md_content_email": md_content_email,  # 이메일용 (최적화된 JPEG 이미지, <1MB) ⚠️ n8n에서는 이 필드를 사용하세요!
+            "image_files": image_files,  # GitHub 푸시용 이미지 파일 목록 (경로: images/{filename}, content: base64)
             "papers_metadata": papers_metadata,
             "source": "url_list" if paper_urls else "pdf_files",
             "confluence_url": (confluence_result or {}).get("page_url"),
