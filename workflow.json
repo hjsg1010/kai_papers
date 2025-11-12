@@ -1,265 +1,427 @@
 {
-  "nodes": [
-    {
-      "parameters": {},
-      "id": "4b7db7a7-5846-44fa-860c-6bbf92ed02bc",
-      "name": "수동 실행",
-      "type": "n8n-nodes-base.manualTrigger",
-      "typeVersion": 1,
-      "position": [
-        -1200,
-        192
-      ]
-    },
-    {
-      "parameters": {
-        "mode": "raw",
-        "jsonOutput": " {\n   \"bucket\": \"aip-llm\",\n   \"prefix\": \"kai_papers/\"\n }",
-        "options": {}
+    "nodes": [
+      {
+        "parameters": {
+          "resource": "file",
+          "operation": "delete",
+          "owner": "aip-llm",
+          "repository": "kai_papers",
+          "filePath": "={{ $json.filePath }}",
+          "commitMessage": "=Delete old {{ $json.filePath }}"
+        },
+        "name": "GitHub Delete",
+        "type": "n8n-nodes-base.github",
+        "position": [
+          112,
+          160
+        ],
+        "id": "e98e4c48-3e82-420e-8942-acacfd608f19",
+        "typeVersion": 1.1,
+        "webhookId": "73b7819e-4c39-443e-9aae-b3a63a041d81",
+        "credentials": {
+          "githubApi": {
+            "id": "NbvzWQd7IcjeJevT",
+            "name": "github_js1010.hong"
+          }
+        },
+        "continueOnFail": true,
+        "onError": "continueRegularOutput"
       },
-      "id": "43b96086-6ae6-471b-ba57-8d251654ab82",
-      "name": "S3 설정",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [
-        -976,
-        192
-      ]
-    },
-    {
-      "parameters": {
-        "url": "=http://10.166.249.91:7070/list-s3-papers",
-        "sendQuery": true,
-        "queryParameters": {
-          "parameters": [
+      {
+        "parameters": {
+          "resource": "file",
+          "owner": "aip-llm",
+          "repository": "kai_papers",
+          "filePath": "={{ $('Markdown 보강').item.json.filePath }}",
+          "fileContent": "={{ $('Markdown 보강').item.json.fileContent }}",
+          "commitMessage": "={{ $('Markdown 보강').item.json.commitMessage }}"
+        },
+        "name": "GitHub Create",
+        "type": "n8n-nodes-base.github",
+        "position": [
+          336,
+          160
+        ],
+        "id": "0a88ef3b-19ce-45f1-8082-8034280bc864",
+        "typeVersion": 1.1,
+        "webhookId": "0401ec8e-6cb4-40d5-8a5b-03851005b855",
+        "credentials": {
+          "githubApi": {
+            "id": "NbvzWQd7IcjeJevT",
+            "name": "github_js1010.hong"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://openapi.samsung.net/mail/api/v2.0/mails/send?userId=js1010.hong",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Authorization",
+                "value": "Bearer 3d0aaa71-599a-3eac-befd-8c167d4a4534"
+              },
+              {
+                "name": "System-ID",
+                "value": "KCC10REST03606"
+              },
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={\n  \"subject\": \"[AI Paper Newsletter] 논문 없음 - {{ $('주차 계산').item.json.week_label }}\",\n  \"docSecuType\": \"PERSONAL\",\n  \"contents\": \"📭 처리할 논문이 없습니다.\\n\\nBucket: {{ $('논문 목록 조회').item.json.bucket }}\\nPrefix: {{ $('논문 목록 조회').item.json.prefix }}\\n\\n논문 파일을 업로드하거나 paper_list.txt를 확인해주세요.\",\n  \"contentType\": \"TEXT\",\n  \"sender\": {\"emailAddress\": \"js1010.hong@samsung.com\"},\n  \"recipients\": [{\"emailAddress\": \"js1010.hong@samsung.com\", \"recipientType\": \"TO\"}]\n}",
+          "options": {}
+        },
+        "name": "논문 없음 메일",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          -560,
+          352
+        ],
+        "id": "6ebf5bb8-b4cc-4a6f-971a-569fd1d5e159",
+        "alwaysOutputData": false
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://openapi.samsung.net/mail/api/v2.0/mails/send?userId=js1010.hong",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Authorization",
+                "value": "Bearer 3d0aaa71-599a-3eac-befd-8c167d4a4534"
+              },
+              {
+                "name": "System-ID",
+                "value": "KCC10REST03606"
+              },
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={\n  \"subject\": \"[AI Paper Newsletter] 처리 실패\",\n  \"docSecuType\": \"PERSONAL\",\n  \"contents\": \"❌ 논문 처리 중 에러가 발생했습니다.\\n\\n{{ $json.errors }}\",\n  \"contentType\": \"TEXT\",\n  \"sender\": {\"emailAddress\": \"js1010.hong@samsung.com\"},\n  \"recipients\": [{\"emailAddress\": \"js1010.hong@samsung.com\", \"recipientType\": \"TO\"}]\n}",
+          "options": {}
+        },
+        "name": "에러 알림 메일",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          -96,
+          304
+        ],
+        "id": "25c90452-ed1e-4dec-b0d2-c3eb7d7ebbac",
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "rule": {
+            "interval": [
+              {
+                "field": "cronExpression",
+                "expression": "0 9 * * 2"
+              }
+            ]
+          }
+        },
+        "name": "매주 화요일 실행",
+        "type": "n8n-nodes-base.scheduleTrigger",
+        "typeVersion": 1.2,
+        "position": [
+          -1456,
+          256
+        ],
+        "id": "7a4d1c1d-6a8e-4115-8fe1-fa3e0e2f1c74"
+      },
+      {
+        "parameters": {
+          "jsCode": "// 주차 계산 코드 (위 참조)\nfunction getISOWeek(date) {\n  const target = new Date(date.valueOf());\n  const dayNr = (date.getDay() + 6) % 7;\n  target.setDate(target.getDate() - dayNr + 3);\n  const jan4 = new Date(target.getFullYear(), 0, 4);\n  const dayDiff = (target - jan4) / 86400000;\n  const weekNum = 1 + Math.ceil(dayDiff / 7);\n  return weekNum;\n}\n\nconst now = new Date();\nconst weekNumber = getISOWeek(now);\n\nconst result = {\n  bucket: \"aip-llm\",\n  prefix: `kai_papers/w${weekNumber}`,\n  week_label: `w${weekNumber}`,\n  year: now.getFullYear(),\n  date: now.toISOString(),\n  weekNumber: weekNumber\n};\n\nconsole.log(`📅 자동 계산: ${result.prefix}`);\n\nreturn [{ json: result }];"
+        },
+        "name": "주차 계산",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          -1232,
+          256
+        ],
+        "id": "0b96b392-dfc9-4844-96ee-ad815e473f13"
+      },
+      {
+        "parameters": {
+          "url": "=http://10.166.249.91:7070/list-s3-papers",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "bucket",
+                "value": "={{ $json.bucket }}"
+              },
+              {
+                "name": "prefix",
+                "value": "={{ $json.prefix }}"
+              }
+            ]
+          },
+          "options": {
+            "response": {
+              "response": {
+                "responseFormat": "json"
+              }
+            },
+            "timeout": 3000000
+          }
+        },
+        "id": "1cb282ae-42a5-4198-b8ac-5bae41f55422",
+        "name": "논문 목록 조회",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          -1008,
+          256
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "number": [
+              {
+                "value1": "={{ $json.papers_found }}",
+                "operation": "larger"
+              }
+            ]
+          }
+        },
+        "id": "a74f6e2d-bf6b-4110-8a28-49c3cd4575a2",
+        "name": "논문 확인",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 1,
+        "position": [
+          -784,
+          256
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "=http://10.166.249.91:7070/process-s3-papers",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={\n  \"bucket\": \"{{ $json.bucket }}\",\n  \"prefix\": \"{{ $json.prefix }}\",\n  \"file_pattern\": \"*.pdf\",\n  \"process_subdirectories\": true,\n  \"week_label\": null,\n  \"upload_confluence\": false\n}",
+          "options": {
+            "timeout": 3600000
+          }
+        },
+        "id": "ce0ff934-0a30-4d1b-b924-d91a1e327915",
+        "name": "논문 처리",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          -560,
+          160
+        ],
+        "notes": "Markdown 생성: md_filename, md_content 반환"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "number": [
+              {
+                "value1": "={{ $json.papers_processed }}",
+                "operation": "larger"
+              }
+            ]
+          }
+        },
+        "id": "55b8dc5c-b13b-43d8-a582-33ee3b0a2b27",
+        "name": "처리 결과 확인",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 1,
+        "position": [
+          -336,
+          160
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "// ===== Markdown 보강 + HTML 메일 (이미지 포함) =====\nconst input = $input.first().json;\n\nlet markdown = input.md_content || '';\nmarkdown = markdown.replace(/~/g, '–');\n\n// 통계 섹션 추가\nmarkdown += \"\\n## 📈 처리 통계\\n\\n\";\nmarkdown += `- **처리된 논문:** ${input.papers_processed}개\\n`;\nmarkdown += `- **생성 일시:** ${new Date().toISOString()}\\n`;\n\n// ===== 이미지 Base64 매핑 생성 =====\nconst imageMap = {};\nif (input.papers_metadata && Array.isArray(input.papers_metadata)) {\n  for (const paper of input.papers_metadata) {\n    if (paper.images_info && paper.images_info.representative_images) {\n      for (const img of paper.images_info.representative_images) {\n        if (img.base64_data) {\n          // 파일명 생성 (Markdown에서 사용하는 형식과 동일)\n          const paperName = paper.s3_key.split('/').pop().replace('.pdf', '');\n          const imgFilename = `${input.week_label}_${paperName}_fig${img.index + 1}.${img.type}`;\n          \n          // base64 데이터 저장\n          imageMap[imgFilename] = {\n            base64: img.base64_data,\n            type: img.type\n          };\n        }\n      }\n    }\n  }\n}\n\nconsole.log('Image map:', Object.keys(imageMap));\n\n// ===== Markdown to HTML 변환 (이미지 포함) =====\nfunction markdownToHtml(md, imgMap) {\n  let html = md;\n  \n  // 이미지 변환: ![alt](images/filename.png) → <img src=\"data:image/png;base64,...\">\n  html = html.replace(/!\\[([^\\]]*)\\]\\(images\\/([^\\)]+)\\)/g, (match, alt, filename) => {\n    if (imgMap[filename]) {\n      const imgData = imgMap[filename];\n      return `<img src=\"data:image/${imgData.type};base64,${imgData.base64}\" alt=\"${alt}\" style=\"max-width: 100%; height: auto; margin: 20px 0;\" />`;\n    }\n    // 이미지 데이터 없으면 텍스트로\n    return `<p><em>[이미지: ${alt}]</em></p>`;\n  });\n  \n  // 제목 변환\n  html = html.replace(/^#### (.+)$/gm, '<h4 style=\"color: #333; margin-top: 20px;\">$1</h4>');\n  html = html.replace(/^### (.+)$/gm, '<h3 style=\"color: #2c3e50; margin-top: 25px;\">$1</h3>');\n  html = html.replace(/^## (.+)$/gm, '<h2 style=\"color: #1a5490; margin-top: 30px; border-bottom: 2px solid #1a5490; padding-bottom: 5px;\">$1</h2>');\n  html = html.replace(/^# (.+)$/gm, '<h1 style=\"color: #0066cc; margin-top: 30px;\">$1</h1>');\n  \n  // 볼드/이탤릭\n  html = html.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');\n  html = html.replace(/\\*(.+?)\\*/g, '<em>$1</em>');\n  \n  // 코드\n  html = html.replace(/`([^`]+)`/g, '<code style=\"background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: monospace;\">$1</code>');\n  \n  // 링크\n  html = html.replace(/\\[([^\\]]+)\\]\\(([^\\)]+)\\)/g, '<a href=\"$2\" style=\"color: #0066cc; text-decoration: none;\">$1</a>');\n  \n  // 리스트\n  html = html.replace(/^- (.+)$/gm, '<li style=\"margin: 5px 0;\">$1</li>');\n  html = html.replace(/(<li[^>]*>.*?<\\/li>\\n?)+/gs, '<ul style=\"margin: 10px 0; padding-left: 25px;\">$&</ul>');\n  \n  // 구분선\n  html = html.replace(/^---$/gm, '<hr style=\"border: none; border-top: 1px solid #ddd; margin: 20px 0;\" />');\n  \n  // 줄바꿈\n  html = html.replace(/\\n\\n/g, '</p><p style=\"margin: 10px 0; line-height: 1.6;\">');\n  html = html.replace(/\\n/g, '<br>');\n  \n  return html;\n}\n\nconst htmlContent = markdownToHtml(markdown, imageMap);\n\n// ===== HTML 메일 본문 생성 =====\nconst mailHtml = `\n<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n</head>\n<body style=\"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f9f9f9;\">\n  <div style=\"background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);\">\n    \n    <div style=\"background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; margin-bottom: 30px;\">\n      <h2 style=\"margin: 0; font-size: 24px;\">✅ 논문 처리가 완료되었습니다!</h2>\n    </div>\n    \n    <div style=\"background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 30px; border-left: 4px solid #667eea;\">\n      <h3 style=\"margin-top: 0; color: #333;\">📊 처리 통계</h3>\n      <ul style=\"list-style: none; padding: 0; margin: 0;\">\n        <li style=\"padding: 8px 0; border-bottom: 1px solid #e9ecef;\">📄 <strong>발견된 논문:</strong> ${input.papers_found}개</li>\n        <li style=\"padding: 8px 0; border-bottom: 1px solid #e9ecef;\">✅ <strong>처리된 논문:</strong> ${input.papers_processed}개</li>\n        <li style=\"padding: 8px 0; border-bottom: 1px solid #e9ecef;\">📂 <strong>소스:</strong> ${input.source || 'pdf_files'}</li>\n        <li style=\"padding: 8px 0;\">📁 <strong>파일명:</strong> ${input.md_filename}</li>\n      </ul>\n    </div>\n    \n    <div style=\"margin-bottom: 30px;\">\n      <a href=\"https://github.samsungds.net/aip-llm/kai_papers/tree/main/weekly_reports\" \n         style=\"display: inline-block; background: #0366d6; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;\">\n        🔗 GitHub에서 보기\n      </a>\n    </div>\n    \n    <hr style=\"border: none; border-top: 2px solid #e9ecef; margin: 40px 0;\">\n    \n    <div style=\"margin-top: 30px;\">\n      <h2 style=\"color: #1a5490; border-bottom: 2px solid #1a5490; padding-bottom: 10px;\">📄 Markdown 전체 내용</h2>\n      <div style=\"margin-top: 20px; line-height: 1.6; color: #333;\">\n        <p style=\"margin: 10px 0; line-height: 1.6;\">${htmlContent}</p>\n      </div>\n    </div>\n    \n    <hr style=\"border: none; border-top: 1px solid #e9ecef; margin: 40px 0;\">\n    \n    <div style=\"text-align: center; color: #6c757d; font-size: 12px;\">\n      <p>🤖 AI Paper Newsletter | 생성 일시: ${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</p>\n    </div>\n    \n  </div>\n</body>\n</html>\n`;\n\n// ===== 메일 데이터 생성 =====\nconst mailData = {\n  subject: `[AI Paper Newsletter] 처리 완료 - ${input.week_label}`,\n  docSecuType: \"PERSONAL\",\n  contents: mailHtml,\n  contentType: \"HTML\",\n  sender: {\n    emailAddress: \"js1010.hong@samsung.com\"\n  },\n  recipients: [\n    {\n      emailAddress: \"js1010.hong@samsung.com\",\n      recipientType: \"TO\"\n    }\n    // {\n    //   emailAddress: \"phd.kim@samsung.com\",\n    //   recipientType: \"TO\"\n    // },\n    // {\n    //   emailAddress: \"yy45.choi@samsung.com\",\n    //   recipientType: \"TO\"\n    // },\n    // {\n    //   emailAddress: \"mijin24.kwon@samsung.com\",\n    //   recipientType: \"TO\"\n    // },\n    // {\n    //   emailAddress: \"taeyo1.kim@samsung.com\",\n    //   recipientType: \"TO\"\n    // },\n    // {\n    //   emailAddress: \"skhn.ha@samsung.com\",\n    //   recipientType: \"TO\"\n    // },\n    // {\n    //   emailAddress: \"jh0102.choi@samsung.com\",\n    //   recipientType: \"TO\"\n    // },\n    // {\n    //   emailAddress: \"myungz.kim@samsung.com\",\n    //   recipientType: \"TO\"\n    // },\n    // {\n    //   emailAddress: \"jiwon.pyo@samsung.com\",\n    //   recipientType: \"TO\"\n    // },\n    // {\n    //   emailAddress: \"jeong.chang@samsung.com\",\n    //   recipientType: \"TO\"\n    // }\n  ]\n};\n\nreturn [{\n  json: {\n    ...mailData,\n    // GitHub 업로드용 데이터도 포함\n    filePath: `weekly_reports/${input.md_filename}`,\n    fileContent: Buffer.from(markdown).toString('base64'),\n    commitMessage: `Add AI Paper Newsletter - ${input.week_label}`\n  }\n}];"
+        },
+        "id": "2e959b64-374e-47fc-af6d-5df8b3e81eff",
+        "name": "Markdown 보강",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          -112,
+          80
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://openapi.samsung.net/mail/api/v2.0/mails/send?userId=js1010.hong",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Authorization",
+                "value": "Bearer 3d0aaa71-599a-3eac-befd-8c167d4a4534"
+              },
+              {
+                "name": "System-ID",
+                "value": "KCC10REST03606"
+              },
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ {\n  \"subject\": $json.subject,\n  \"docSecuType\": $json.docSecuType,\n  \"contents\": $json.contents,\n  \"contentType\": $json.contentType,\n  \"sender\": $json.sender,\n  \"recipients\": $json.recipients\n} }}",
+          "options": {}
+        },
+        "id": "3dbf3d30-a8e4-40eb-9f24-8a99f58bb5ec",
+        "name": "처리 완료 메일",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          112,
+          0
+        ]
+      }
+    ],
+    "connections": {
+      "GitHub Delete": {
+        "main": [
+          [
             {
-              "name": "bucket",
-              "value": "={{ $json.bucket }}"
+              "node": "GitHub Create",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "매주 화요일 실행": {
+        "main": [
+          [
+            {
+              "node": "주차 계산",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "주차 계산": {
+        "main": [
+          [
+            {
+              "node": "논문 목록 조회",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "논문 목록 조회": {
+        "main": [
+          [
+            {
+              "node": "논문 확인",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "논문 확인": {
+        "main": [
+          [
+            {
+              "node": "논문 처리",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "논문 없음 메일",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "논문 처리": {
+        "main": [
+          [
+            {
+              "node": "처리 결과 확인",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "처리 결과 확인": {
+        "main": [
+          [
+            {
+              "node": "Markdown 보강",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "에러 알림 메일",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Markdown 보강": {
+        "main": [
+          [
+            {
+              "node": "처리 완료 메일",
+              "type": "main",
+              "index": 0
             },
             {
-              "name": "prefix",
-              "value": "={{ $json.prefix }}"
+              "node": "GitHub Delete",
+              "type": "main",
+              "index": 0
             }
           ]
-        },
-        "options": {
-          "response": {
-            "response": {
-              "responseFormat": "json"
-            }
-          },
-          "timeout": 30000
-        }
-      },
-      "id": "011c174d-893f-482e-9bbf-d8f8f30d7c03",
-      "name": "논문 목록 조회",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -752,
-        192
-      ]
+        ]
+      }
     },
-    {
-      "parameters": {
-        "conditions": {
-          "number": [
-            {
-              "value1": "={{ $json.papers_found }}",
-              "operation": "larger"
-            }
-          ]
-        }
-      },
-      "id": "0e1a93e3-5531-4a28-ab62-dfc91689ce05",
-      "name": "논문 확인",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 1,
-      "position": [
-        -528,
-        192
-      ]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "http://paper-processor:8000/process-s3-papers",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={\n  \"bucket\": \"{{ $('S3 설정').item.json.bucket }}\",\n  \"prefix\": \"{{ $('S3 설정').item.json.prefix }}\",\n  \"file_pattern\": \"*.pdf\",\n  \"process_subdirectories\": true\n}",
-        "options": {
-          "timeout": 600000
-        }
-      },
-      "id": "6b273dc6-c281-4e26-9c86-ad8c8681b7d2",
-      "name": "논문 처리",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -304,
-        96
-      ]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "number": [
-            {
-              "value1": "={{ $json.papers_processed }}",
-              "operation": "larger"
-            }
-          ]
-        }
-      },
-      "id": "ea9e9620-962d-4a6d-bed3-132124478015",
-      "name": "처리 결과 확인",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 1,
-      "position": [
-        -80,
-        96
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "sendMessage"
-      },
-      "id": "5d7c3c69-282c-49e6-bbc2-8d3c4941e751",
-      "name": "성공 알림",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.2,
-      "position": [
-        144,
-        0
-      ],
-      "webhookId": "1c097b58-6628-47fc-ab78-c0f5153f61f9",
-      "credentials": {}
-    },
-    {
-      "parameters": {
-        "operation": "sendMessage"
-      },
-      "id": "c2a42d79-c1c5-47bb-b8ee-86b8d6adabdb",
-      "name": "실패 알림",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.2,
-      "position": [
-        144,
-        192
-      ],
-      "webhookId": "7b10725c-b3a7-4296-a769-ae2618fa0493",
-      "credentials": {}
-    },
-    {
-      "parameters": {
-        "operation": "sendMessage"
-      },
-      "id": "53eb481c-fb95-48cd-ac4a-36e0a1d684b1",
-      "name": "논문 없음 알림",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.2,
-      "position": [
-        -304,
-        288
-      ],
-      "webhookId": "2b8fc572-39b4-48af-9879-18c35dab814e",
-      "credentials": {}
+    "pinData": {},
+    "meta": {
+      "templateCredsSetupCompleted": true,
+      "instanceId": "47166031170a48a31767ca465d7b21df7a22ea3ffc18747c9dff381493c0c365"
     }
-  ],
-  "connections": {
-    "수동 실행": {
-      "main": [
-        [
-          {
-            "node": "S3 설정",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "S3 설정": {
-      "main": [
-        [
-          {
-            "node": "논문 목록 조회",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "논문 목록 조회": {
-      "main": [
-        [
-          {
-            "node": "논문 확인",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "논문 확인": {
-      "main": [
-        [
-          {
-            "node": "논문 처리",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "논문 없음 알림",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "논문 처리": {
-      "main": [
-        [
-          {
-            "node": "처리 결과 확인",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "처리 결과 확인": {
-      "main": [
-        [
-          {
-            "node": "성공 알림",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "실패 알림",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    }
-  },
-  "pinData": {},
-  "meta": {
-    "templateCredsSetupCompleted": true,
-    "instanceId": "47166031170a48a31767ca465d7b21df7a22ea3ffc18747c9dff381493c0c365"
   }
-}
