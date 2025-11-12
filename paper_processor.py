@@ -245,7 +245,18 @@ async def process_s3_papers(request: S3PapersRequest):
                     errors.append(err)
 
         week_label = request.week_label or derive_week_label(prefix)
-        md_filename, md_content = build_markdown(analyses, papers_metadata, week_label, prefix)
+
+        # GitHub용 markdown (이미지 포함)
+        md_filename, md_content = build_markdown(
+            analyses, papers_metadata, week_label, prefix,
+            save_images=True, include_images=True
+        )
+
+        # 메일용 markdown (이미지 제외 - 크기 제한 때문)
+        _, md_content_email = build_markdown(
+            analyses, papers_metadata, week_label, prefix,
+            save_images=False, include_images=False
+        )
 
         confluence_result = None
         if request.upload_confluence and analyses:
@@ -262,6 +273,7 @@ async def process_s3_papers(request: S3PapersRequest):
             "week_label": week_label,
             "md_filename": md_filename,
             "md_content": md_content,
+            "md_content_email": md_content_email,  # 메일용 (이미지 없음)
             "papers_metadata": papers_metadata,
             "source": "url_list" if paper_urls else "pdf_files",
             "confluence_url": (confluence_result or {}).get("page_url"),

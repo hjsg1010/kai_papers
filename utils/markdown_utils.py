@@ -169,7 +169,8 @@ def build_markdown(
     papers_metadata: Optional[List[Dict]] = None,
     week_label: str = "",
     prefix: str = "",
-    save_images: bool = True
+    save_images: bool = True,
+    include_images: bool = True
 ) -> Tuple[str, str]:
     """
     논문 분석 결과를 Markdown으로 변환
@@ -180,6 +181,7 @@ def build_markdown(
         week_label: 주차 레이블 (예: "w42")
         prefix: S3 prefix
         save_images: 이미지를 파일로 저장할지 여부
+        include_images: 이미지 섹션을 포함할지 여부 (메일용: False, GitHub용: True)
 
     Returns:
         Tuple[str, str]: (파일명, Markdown 콘텐츠)
@@ -231,8 +233,8 @@ Source prefix: `{prefix}`
 
 {abstract_block}"""
 
-        # 이미지 섹션 추가
-        if a.source_file in image_map:
+        # 이미지 섹션 추가 (옵션)
+        if include_images and a.source_file in image_map:
             img_info = image_map[a.source_file]
             rep_imgs = img_info.get('representative_images', [])
 
