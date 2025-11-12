@@ -8,7 +8,7 @@ The `paper_procesor.py` file has been refactored from a monolithic ~2,220 line f
 
 ```
 kai_papers/
-├── paper_procesor.py          # Main FastAPI application (479 lines, was 2,220)
+├── paper_processor.py         # Main FastAPI application (479 lines, was 2,220)
 ├── models.py                   # Pydantic models for API requests/responses
 │
 ├── config/
@@ -20,12 +20,13 @@ kai_papers/
 │   ├── s3_service.py          # AWS S3 operations
 │   ├── docpamin_service.py    # Docpamin PDF parsing
 │   ├── llm_service.py         # LLM API calls
-│   └── confluence_service.py  # Confluence upload and markdown building
+│   └── confluence_service.py  # Confluence API integration
 │
 └── utils/
     ├── __init__.py
     ├── image_processing.py    # Image extraction and processing
-    └── text_processing.py     # Text chunking and summarization
+    ├── text_processing.py     # Text chunking and summarization
+    └── markdown_utils.py      # Markdown formatting and newsletter generation
 ```
 
 ## Module Breakdown
@@ -95,15 +96,12 @@ MAX_WORKERS
 **Dependencies**: `requests`, `config.settings`
 
 ### 6. `services/confluence_service.py`
-**Purpose**: Confluence upload and markdown generation
+**Purpose**: Confluence API integration
 
 **Functions**:
 - `_conf_get_page_by_title()` - Get Confluence page by title
 - `_conf_escape()` - Escape HTML special characters
 - `upload_to_confluence()` - Upload analyses to Confluence
-- `derive_week_label()` - Extract week label from prefix
-- `build_markdown()` - Build markdown newsletter from analyses
-- `format_summary_as_markdown()` - Format JSON summary as markdown
 
 **Dependencies**: `requests`, `models`, `config.settings`
 
@@ -140,7 +138,18 @@ MAX_WORKERS
 
 **Dependencies**: `services.llm_service`, `utils.image_processing`, `models`, `config.settings`
 
-### 9. `paper_procesor.py` (Refactored)
+### 9. `utils/markdown_utils.py`
+**Purpose**: Markdown formatting and newsletter generation
+
+**Functions**:
+- `derive_week_label()` - Extract week label from prefix
+- `save_images_to_files()` - Save base64 images to image files
+- `format_summary_as_markdown()` - Format JSON summary as markdown
+- `build_markdown()` - Build markdown newsletter from analyses
+
+**Dependencies**: `models`, `base64`, `os`, `pathlib`
+
+### 10. `paper_processor.py` (Refactored)
 **Purpose**: FastAPI application and API endpoints only
 
 **Contents**:
@@ -209,10 +218,12 @@ When adding new features:
 2. **New S3 operation** → Add to `services/s3_service.py`
 3. **New parsing logic** → Add to `services/docpamin_service.py`
 4. **New LLM call** → Add to `services/llm_service.py`
-5. **New image processing** → Add to `utils/image_processing.py`
-6. **New text processing** → Add to `utils/text_processing.py`
-7. **New configuration** → Add to `config/settings.py`
-8. **New request/response model** → Add to `models.py`
+5. **New Confluence operation** → Add to `services/confluence_service.py`
+6. **New image processing** → Add to `utils/image_processing.py`
+7. **New text processing** → Add to `utils/text_processing.py`
+8. **New markdown formatting** → Add to `utils/markdown_utils.py`
+9. **New configuration** → Add to `config/settings.py`
+10. **New request/response model** → Add to `models.py`
 
 ## Backup
 

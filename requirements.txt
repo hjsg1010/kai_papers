@@ -18,5 +18,8 @@ python-dotenv
 pydantic
 pydantic-settings
 
+# Image Processing
+Pillow
+
 # Logging
 python-json-logger
