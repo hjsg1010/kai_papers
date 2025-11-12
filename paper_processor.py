@@ -18,6 +18,7 @@ from services.llm_service import *
 from services.confluence_service import *
 from utils.image_processing import *
 from utils.text_processing import *
+from utils.markdown_utils import *
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
