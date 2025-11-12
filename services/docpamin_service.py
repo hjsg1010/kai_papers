@@ -196,27 +196,36 @@ def parse_pdf_with_docpamin(pdf_path: str) -> Tuple[str, Dict]:
         if not task_id:
             raise Exception("Docpamin: no task_id returned")
 
-        logger.info(f"Docpamin task: {task_id}")
+        logger.info(f"Docpamin task created: {task_id}")
         max_wait, waited, backoff = 600, 0, 2
         while waited < max_wait:
             s = session.get(f"{DOCPAMIN_BASE_URL}/tasks/{task_id}",
                             verify=DOCPAMIN_CRT_FILE, timeout=REQ_TIMEOUT)
             s.raise_for_status()
             status = s.json().get("status")
+            logger.debug(f"Task {task_id} status: {status}, waited: {waited}s")
             if status == "DONE":
+                logger.info(f"Task {task_id} completed after {waited}s")
                 break
             if status in {"FAILED", "ERROR"}:
-                raise Exception(f"Docpamin task failed: {status}")
+                error_msg = s.json().get("error", "Unknown error")
+                raise Exception(f"Docpamin task failed: {status}, error: {error_msg}")
             time.sleep(backoff)
             waited += backoff
             backoff = min(backoff * 1.5, 10)
         if waited >= max_wait:
-            raise Exception("Docpamin timeout")
+            raise Exception(f"Docpamin timeout after {max_wait}s, task_id: {task_id}")
 
+        logger.info(f"Exporting task {task_id}...")
         opts = {"task_ids": [task_id], "output_types": ["markdown", "json"]}
         e = session.post(f"{DOCPAMIN_BASE_URL}/tasks/export", json=opts,
                          verify=DOCPAMIN_CRT_FILE, timeout=REQ_TIMEOUT)
-        e.raise_for_status()
+        try:
+            e.raise_for_status()
+        except requests.exceptions.HTTPError as err:
+            logger.error(f"Export failed for task_id={task_id}: {err}")
+            logger.error(f"Response: {e.text[:500]}")
+            raise
 
         md, meta = "", {}
         with zipfile.ZipFile(io.BytesIO(e.content)) as zf:
@@ -363,7 +372,7 @@ def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, 
         if not task_id:
             raise Exception("Docpamin: no task_id returned")
 
-        logger.info(f"Docpamin task: {task_id}")
+        logger.info(f"Docpamin task created: {task_id}")
 
         # 상태 폴링
         max_wait, waited, backoff = 600, 0, 2
@@ -375,18 +384,22 @@ def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, 
             )
             s.raise_for_status()
             status = s.json().get("status")
+            logger.debug(f"Task {task_id} status: {status}, waited: {waited}s")
             if status == "DONE":
+                logger.info(f"Task {task_id} completed after {waited}s")
                 break
             if status in {"FAILED", "ERROR"}:
-                raise Exception(f"Docpamin task failed: {status}")
+                error_msg = s.json().get("error", "Unknown error")
+                raise Exception(f"Docpamin task failed: {status}, error: {error_msg}")
             time.sleep(backoff)
             waited += backoff
             backoff = min(backoff * 1.5, 10)
 
         if waited >= max_wait:
-            raise Exception("Docpamin timeout")
+            raise Exception(f"Docpamin timeout after {max_wait}s, task_id: {task_id}")
 
         # Export
+        logger.info(f"Exporting task {task_id}...")
         opts = {"task_ids": [task_id], "output_types": ["markdown", "json"]}
         e = session.post(
             f"{DOCPAMIN_BASE_URL}/tasks/export",
@@ -394,7 +407,12 @@ def parse_pdf_with_docpamin_url(pdf_url: str, arxiv_id: str = "") -> Tuple[str, 
             verify=DOCPAMIN_CRT_FILE,
             timeout=REQ_TIMEOUT
         )
-        e.raise_for_status()
+        try:
+            e.raise_for_status()
+        except requests.exceptions.HTTPError as err:
+            logger.error(f"Export failed for task_id={task_id}: {err}")
+            logger.error(f"Response: {e.text[:500]}")
+            raise
 
         md, meta = "", {}
         with zipfile.ZipFile(io.BytesIO(e.content)) as zf:
