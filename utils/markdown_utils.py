@@ -407,12 +407,21 @@ Source prefix: `{prefix}`
                 paper_name = Path(a.source_file).stem
                 img_filename = f"{week_label}_{paper_name}_fig{rep_img['index'] + 1}.{rep_img['type']}"
 
+                # 이메일용: base64 embedded 이미지 사용
+                if optimize_for_email and rep_img.get('base64_data'):
+                    # JPEG 형식으로 가정 (resize_image_base64에서 JPEG로 변환함)
+                    base64_data = rep_img['base64_data']
+                    image_src = f"data:image/jpeg;base64,{base64_data}"
+                else:
+                    # GitHub용: 파일 경로 사용
+                    image_src = f"images/{img_filename}"
+
                 sec += f"""### 📊 대표 이미지
 
 **전체 이미지:** {img_info['total_images']}개
 **대표 이미지:** Figure {rep_img['index'] + 1} ({rep_img['size_kb']:.1f}KB)
 
-![Figure {rep_img['index'] + 1}](images/{img_filename})
+![Figure {rep_img['index'] + 1}]({image_src})
 
 """
 
